@@ -1,7 +1,9 @@
 """Data Manager page for the Streamlit app.
 
 Lists every saved extraction, lets the user edit cells inline, run SQL,
-delete rows, and download the full table. The underlying store is SQLite.
+delete rows, and download the full table. The Needs Review pane is
+recomputed from current saved values, so it stays accurate after manual
+edits.
 """
 
 from __future__ import annotations
@@ -13,6 +15,71 @@ import pandas as pd
 import streamlit as st
 
 from . import storage
+from .extractor import CONFIDENCE_THRESHOLD, CRITICAL_FIELDS
+from .schema import SDSExtraction
+
+
+def _compute_gaps(row: pd.Series) -> tuple[list[str], list[str]]:
+    """Return (critical_gaps, other_gaps) for a saved row, computed live
+    from the current values rather than the stored review_reasons string.
+    """
+    sds_fields = list(SDSExtraction.model_fields.keys())
+    critical: list[str] = []
+    other: list[str] = []
+    for fname in sds_fields:
+        value = row.get(fname, "")
+        conf = row.get(f"{fname}_confidence")
+        if value in (None, ""):
+            gap = f"{fname}: empty"
+        elif conf is not None and not pd.isna(conf) and int(conf) < CONFIDENCE_THRESHOLD:
+            gap = f"{fname}: low confidence ({int(conf)})"
+        else:
+            continue
+        if fname in CRITICAL_FIELDS:
+            critical.append(gap)
+        else:
+            other.append(gap)
+    return critical, other
+
+
+def _render_needs_review(df: pd.DataFrame) -> None:
+    items = []
+    for _, row in df.iterrows():
+        crit, other = _compute_gaps(row)
+        if crit or other:
+            items.append({
+                "label": row["label"],
+                "product_name": row.get("product_name", "") or "",
+                "critical": crit,
+                "other": other,
+            })
+    items.sort(key=lambda x: (-len(x["critical"]), -len(x["other"])))
+
+    st.subheader("Needs review")
+    if not items:
+        st.success("All saved records have complete, high-confidence values.")
+        return
+
+    st.caption(
+        f"{len(items)} of {len(df)} record(s) have empty or low-confidence "
+        f"fields (confidence threshold: {CONFIDENCE_THRESHOLD}). Sorted by "
+        "critical-gap count."
+    )
+    for item in items:
+        crit_n, other_n = len(item["critical"]), len(item["other"])
+        title_parts = [item["label"]]
+        if item["product_name"]:
+            title_parts.append(f"— {item['product_name']}")
+        title_parts.append(f"| {crit_n} critical, {other_n} other")
+        with st.expander(" ".join(title_parts)):
+            if item["critical"]:
+                st.markdown("**Critical fields:**")
+                for g in item["critical"]:
+                    st.markdown(f"- {g}")
+            if item["other"]:
+                st.markdown("**Other fields:**")
+                for g in item["other"]:
+                    st.markdown(f"- {g}")
 
 
 def render() -> None:
@@ -24,24 +91,24 @@ def render() -> None:
     )
 
     df = storage.list_records()
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.metric("Saved records", len(df))
-    with col_b:
-        backend = storage.backend()
-        label = "Turso (persistent)" if backend == "turso" else "Local SQLite"
-        st.metric("Backend", label)
+    st.metric("Saved records", len(df))
 
     if df.empty:
         st.info("No records yet. Run an extraction to populate this table.")
         return
 
+    _render_needs_review(df)
+
+    st.divider()
     st.subheader("SQL query")
     st.caption(
         "Table: `products`. Columns are snake_case. SELECT returns rows; "
         "UPDATE/DELETE/INSERT report row count. One statement at a time."
     )
-    sql_default = st.session_state.get("sql_query", "SELECT label, product_name, flash_point_c, transport_regulated FROM products ORDER BY saved_at DESC")
+    sql_default = st.session_state.get(
+        "sql_query",
+        "SELECT label, product_name, flash_point_c, transport_regulated FROM products ORDER BY saved_at DESC",
+    )
     sql = st.text_area(
         "Query",
         value=sql_default,
