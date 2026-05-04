@@ -19,9 +19,10 @@ from .extractor import CONFIDENCE_THRESHOLD, CRITICAL_FIELDS
 from .schema import SDSExtraction
 
 
-def _compute_gaps(row: pd.Series) -> tuple[list[str], list[str]]:
-    """Return (critical_gaps, other_gaps) for a saved row, computed live
-    from the current values rather than the stored review_reasons string.
+def _gap_fields(row: pd.Series) -> tuple[list[str], list[str]]:
+    """Return (critical_field_names, other_field_names) with gaps,
+    computed live from the current values rather than the stored
+    review_reasons string.
     """
     sds_fields = list(SDSExtraction.model_fields.keys())
     critical: list[str] = []
@@ -29,27 +30,64 @@ def _compute_gaps(row: pd.Series) -> tuple[list[str], list[str]]:
     for fname in sds_fields:
         value = row.get(fname, "")
         conf = row.get(f"{fname}_confidence")
-        if value in (None, ""):
-            gap = f"{fname}: empty"
-        elif conf is not None and not pd.isna(conf) and int(conf) < CONFIDENCE_THRESHOLD:
-            gap = f"{fname}: low confidence ({int(conf)})"
-        else:
-            continue
-        if fname in CRITICAL_FIELDS:
-            critical.append(gap)
-        else:
-            other.append(gap)
+        empty = value in (None, "")
+        low = (
+            conf is not None
+            and not pd.isna(conf)
+            and int(conf) < CONFIDENCE_THRESHOLD
+        )
+        if empty or low:
+            (critical if fname in CRITICAL_FIELDS else other).append(fname)
     return critical, other
+
+
+def _build_review_table(row: pd.Series, fields: list[str], critical_set: set[str]) -> pd.DataFrame:
+    rows = []
+    for f in fields:
+        rows.append({
+            "Field": f,
+            "Critical": "Yes" if f in critical_set else "",
+            "Value": row.get(f, "") or "",
+            "Confidence": row.get(f"{f}_confidence"),
+            "Evidence": row.get(f"{f}_evidence", "") or "",
+            "Source": row.get(f"{f}_source", "") or "",
+        })
+    return pd.DataFrame(rows)
+
+
+def _apply_review_edits(label: str, original_df: pd.DataFrame, edited: pd.DataFrame) -> int:
+    """Write back any value edits for the given label. Sets confidence to
+    100 on edited fields (human-verified). Returns the number of fields
+    actually changed.
+    """
+    full = storage.list_records()
+    mask = full["label"] == label
+    if not mask.any():
+        return 0
+    changed = 0
+    for _, new_row in edited.iterrows():
+        field = new_row["Field"]
+        new_val = "" if new_row["Value"] is None else str(new_row["Value"])
+        orig = original_df.loc[original_df["Field"] == field, "Value"]
+        orig_val = "" if orig.empty else str(orig.iloc[0] or "")
+        if new_val != orig_val:
+            full.loc[mask, field] = new_val
+            full.loc[mask, f"{field}_confidence"] = 100
+            changed += 1
+    if changed:
+        storage.replace_table(full)
+    return changed
 
 
 def _render_needs_review(df: pd.DataFrame) -> None:
     items = []
     for _, row in df.iterrows():
-        crit, other = _compute_gaps(row)
+        crit, other = _gap_fields(row)
         if crit or other:
             items.append({
                 "label": row["label"],
                 "product_name": row.get("product_name", "") or "",
+                "row": row,
                 "critical": crit,
                 "other": other,
             })
@@ -62,24 +100,58 @@ def _render_needs_review(df: pd.DataFrame) -> None:
 
     st.caption(
         f"{len(items)} of {len(df)} record(s) have empty or low-confidence "
-        f"fields (confidence threshold: {CONFIDENCE_THRESHOLD}). Sorted by "
-        "critical-gap count."
+        f"fields (confidence threshold: {CONFIDENCE_THRESHOLD}). Critical fields "
+        "appear first in each record. Edit the Value column inline; saved "
+        "edits are marked confidence 100 (human-verified)."
     )
+
     for item in items:
         crit_n, other_n = len(item["critical"]), len(item["other"])
-        title_parts = [item["label"]]
-        if item["product_name"]:
-            title_parts.append(f"— {item['product_name']}")
-        title_parts.append(f"| {crit_n} critical, {other_n} other")
-        with st.expander(" ".join(title_parts)):
-            if item["critical"]:
-                st.markdown("**Critical fields:**")
-                for g in item["critical"]:
-                    st.markdown(f"- {g}")
-            if item["other"]:
-                st.markdown("**Other fields:**")
-                for g in item["other"]:
-                    st.markdown(f"- {g}")
+        title = (
+            f"{item['label']}"
+            + (f" — {item['product_name']}" if item['product_name'] else "")
+            + f"  |  {crit_n} critical, {other_n} other"
+        )
+        with st.expander(title):
+            ordered_fields = item["critical"] + item["other"]
+            critical_set = set(item["critical"])
+            review_df = _build_review_table(item["row"], ordered_fields, critical_set)
+
+            edited = st.data_editor(
+                review_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key=f"review_editor_{item['label']}",
+                column_config={
+                    "Field": st.column_config.TextColumn(disabled=True, width="medium"),
+                    "Critical": st.column_config.TextColumn(disabled=True, width="small"),
+                    "Value": st.column_config.TextColumn(
+                        help="Double-click to edit. Saving sets confidence to 100.",
+                        width="medium",
+                    ),
+                    "Confidence": st.column_config.NumberColumn(disabled=True, width="small"),
+                    "Evidence": st.column_config.TextColumn(disabled=True, width="large"),
+                    "Source": st.column_config.LinkColumn(
+                        disabled=True, display_text=r"https?://([^/]+)/.*", width="small"
+                    ),
+                },
+            )
+
+            if st.button(
+                f"Save edits to {item['label']}",
+                type="primary",
+                key=f"review_save_{item['label']}",
+            ):
+                try:
+                    n = _apply_review_edits(item["label"], review_df, edited)
+                    if n == 0:
+                        st.info("No changes detected.")
+                    else:
+                        st.success(f"Saved {n} field edit(s). Refreshing.")
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"Save failed: {exc}")
 
 
 def render() -> None:
