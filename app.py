@@ -56,15 +56,37 @@ def _password_gate() -> None:
 
 _password_gate()
 
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] {
+        opacity: 1 !important;
+        visibility: visible !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 with st.sidebar:
-    st.header("Navigation")
-    page = st.radio(
-        "Page",
-        options=["Extract", "Data Manager"],
-        label_visibility="collapsed",
-        key="nav_page",
-    )
-    st.divider()
+    page_options = ["Extract", "Data Manager"]
+    if hasattr(st, "segmented_control"):
+        page = st.segmented_control(
+            "Page",
+            options=page_options,
+            default=st.session_state.get("nav_page", "Extract"),
+            label_visibility="collapsed",
+            key="nav_page",
+        )
+    else:
+        page = st.radio(
+            "Page",
+            options=page_options,
+            label_visibility="collapsed",
+            key="nav_page",
+        )
 
 
 def _render_extract() -> None:
@@ -77,21 +99,14 @@ def _render_extract() -> None:
         "to the Data Manager."
     )
 
-    with st.sidebar:
-        st.header("Run Settings")
-        st.markdown(
-            "Paste one product per line. Use NDC numbers (e.g., `0067-1086-30`) "
-            "or product names (e.g., `atorvastatin`). NDCs are more accurate."
-        )
-        sample_queries = ["atorvastatin", "sertraline", "ibuprofen"]
-        if st.button("Load 3 sample products"):
-            st.session_state["product_input"] = "\n".join(sample_queries)
-        st.divider()
-        st.markdown("**Confidence threshold for human review:** 60")
-        st.markdown(
-            "Rows where any critical field (transport, flash point, RCRA, "
-            "physical state) has confidence below 60 are flagged."
-        )
+    st.caption(
+        "Paste one product per line. Use NDC numbers (e.g., `0067-1086-30`) "
+        "or product names (e.g., `atorvastatin`). NDCs are more accurate."
+    )
+
+    sample_queries = ["atorvastatin", "sertraline", "ibuprofen"]
+    if st.button("Load 3 sample products"):
+        st.session_state["product_input"] = "\n".join(sample_queries)
 
     product_input = st.text_area(
         "Products to research",
@@ -99,6 +114,7 @@ def _render_extract() -> None:
         height=180,
         placeholder="atorvastatin\nsertraline\nibuprofen",
         key="product_input",
+        label_visibility="collapsed",
     )
 
     run_clicked = st.button(
