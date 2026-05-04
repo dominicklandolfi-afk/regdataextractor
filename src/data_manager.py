@@ -199,21 +199,99 @@ def render() -> None:
 
     st.divider()
     st.subheader("All saved records")
-    st.caption("Edit any cell, then click 'Save edits' to write back to the database. The 'label' column is the primary key — keep it unique.")
+    st.caption("Search, filter, and edit. The 'label' column is the primary key (read-only here — use the SQL pane to rename a record).")
 
+    essentials = (
+        ["label", "input_query", "product_name", "needs_review", "manufacturer", "dosage_form"]
+        + list(SDSExtraction.model_fields.keys())
+    )
+    essentials = [c for c in essentials if c in df.columns]
+    all_cols = list(df.columns)
+
+    fcol1, fcol2 = st.columns([2, 2])
+    with fcol1:
+        search = st.text_input(
+            "Search",
+            placeholder="e.g. ibuprofen, UN1950, hoboken",
+            key="dm_search",
+            help="Matches anywhere in any column.",
+        ).strip()
+    with fcol2:
+        col_filter = st.selectbox(
+            "Filter column",
+            options=["(no column filter)"] + all_cols,
+            key="dm_filter_col",
+        )
+
+    filter_value = ""
+    if col_filter and col_filter != "(no column filter)":
+        filter_value = st.text_input(
+            f"Match in `{col_filter}`",
+            placeholder="e.g. Aerosol, YES, Pfizer",
+            key="dm_filter_val",
+        ).strip()
+
+    filtered = df.copy()
+    if search:
+        mask = filtered.astype(str).apply(
+            lambda col: col.str.contains(search, case=False, na=False, regex=False)
+        ).any(axis=1)
+        filtered = filtered[mask]
+    if filter_value:
+        s = filtered[col_filter].astype(str)
+        filtered = filtered[s.str.contains(filter_value, case=False, na=False, regex=False)]
+
+    ccol1, ccol2 = st.columns([3, 1])
+    with ccol1:
+        visible = st.multiselect(
+            "Show columns",
+            options=all_cols,
+            default=st.session_state.get("dm_visible_cols", essentials),
+            key="dm_visible_cols",
+        )
+    with ccol2:
+        st.write("")  # spacer to align with the multiselect label
+        if st.button("Show all columns"):
+            st.session_state["dm_visible_cols"] = all_cols
+            st.rerun()
+        if st.button("Reset to essentials"):
+            st.session_state["dm_visible_cols"] = essentials
+            st.rerun()
+
+    if not visible:
+        visible = essentials
+    if "label" not in visible:
+        visible = ["label"] + visible
+
+    st.caption(
+        f"Showing {len(filtered)} of {len(df)} records, "
+        f"{len(visible)} of {len(all_cols)} columns."
+    )
+
+    view = filtered[visible]
     edited = st.data_editor(
-        df,
+        view,
         use_container_width=True,
         num_rows="fixed",
         height=420,
         key="data_manager_editor",
+        column_config={
+            "label": st.column_config.TextColumn(disabled=True),
+        },
     )
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("Save edits", type="primary"):
             try:
-                count = storage.replace_table(edited)
+                merged = df.set_index("label").copy()
+                e_idx = edited.set_index("label")
+                for col in visible:
+                    if col == "label" or col not in merged.columns:
+                        continue
+                    merged.loc[e_idx.index, col] = e_idx[col]
+                merged = merged.reset_index()
+                count = storage.replace_table(merged)
                 st.success(f"Saved {count} record(s).")
                 st.rerun()
             except Exception as exc:
@@ -222,7 +300,7 @@ def render() -> None:
     with col2:
         labels_to_delete = st.multiselect(
             "Delete labels",
-            options=df["label"].tolist(),
+            options=filtered["label"].tolist(),
             key="delete_labels",
         )
         if st.button("Delete selected", disabled=not labels_to_delete):
@@ -232,19 +310,20 @@ def render() -> None:
 
     with col3:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_df = filtered[visible]
         buf = BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            edited.to_excel(writer, sheet_name="Saved Records", index=False)
+            export_df.to_excel(writer, sheet_name="Saved Records", index=False)
         buf.seek(0)
         st.download_button(
-            label="Download xlsx",
+            label="Download xlsx (current view)",
             data=buf,
             file_name=f"saved_extractions_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        csv = edited.to_csv(index=False).encode("utf-8")
+        csv = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="Download csv",
+            label="Download csv (current view)",
             data=csv,
             file_name=f"saved_extractions_{ts}.csv",
             mime="text/csv",
