@@ -23,8 +23,34 @@ from typing import Any, Iterable, Optional
 
 import pandas as pd
 
-from .extractor import to_flat_dict
+from .extractor import CONFIDENCE_THRESHOLD, to_flat_dict
 from .schema import ProductRecord, SDSExtraction
+
+
+def _compute_review_status(row) -> tuple[str, str]:
+    """Single source of truth for needs_review and review_reasons.
+    A field counts as a gap when its value is empty/None or its confidence
+    is below the threshold. Operates on either a dict or a pandas Series.
+    """
+    reasons: list[str] = []
+    for fname in SDSExtraction.model_fields.keys():
+        value = row.get(fname, "")
+        if (
+            value is None
+            or (isinstance(value, float) and math.isnan(value))
+            or str(value).strip() == ""
+        ):
+            reasons.append(f"{fname}: missing value")
+            continue
+        conf = row.get(f"{fname}_confidence")
+        if conf is None or (isinstance(conf, float) and math.isnan(conf)):
+            continue
+        try:
+            if int(conf) < CONFIDENCE_THRESHOLD:
+                reasons.append(f"{fname}: low confidence ({int(conf)})")
+        except (ValueError, TypeError):
+            pass
+    return ("YES" if reasons else "no", "; ".join(reasons))
 
 LOCAL_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "extractions.db"
 
@@ -155,8 +181,8 @@ def _record_to_row(record: ProductRecord, label: str) -> dict:
         "label": label,
         "input_query": record.input_query,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "needs_review": flat.get("Needs Review", ""),
-        "review_reasons": flat.get("Review Reasons", ""),
+        "needs_review": "",
+        "review_reasons": "",
         "ndc": flat.get("NDC", ""),
         "product_name": flat.get("Product Name", ""),
         "generic_name": flat.get("Generic Name", ""),
@@ -170,6 +196,9 @@ def _record_to_row(record: ProductRecord, label: str) -> dict:
             row[f"{fname}_confidence"] = field.get("confidence")
             row[f"{fname}_evidence"] = field.get("evidence_quote") or ""
             row[f"{fname}_source"] = field.get("source_url") or ""
+    needs, reasons = _compute_review_status(row)
+    row["needs_review"] = needs
+    row["review_reasons"] = reasons
     return row
 
 
@@ -207,7 +236,12 @@ def list_records() -> pd.DataFrame:
     cur = conn.execute('SELECT * FROM products ORDER BY saved_at DESC')
     cols = [d[0] for d in cur.description]
     rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        statuses = df.apply(_compute_review_status, axis=1)
+        df["needs_review"] = [s[0] for s in statuses]
+        df["review_reasons"] = [s[1] for s in statuses]
+    return df
 
 
 def delete_records(labels: Iterable[str]) -> int:
