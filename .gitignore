@@ -4,5 +4,7 @@ __pycache__/
 .venv/
 venv/
 output/
+data/
 *.xlsx
+*.db
 .streamlit/secrets.toml
