@@ -231,6 +231,46 @@ def save_records(records: Iterable[ProductRecord]) -> list[str]:
     return [save_record(r) for r in records]
 
 
+def add_blank_record(input_query: str, product_name: str = "") -> str:
+    """Insert a manually-created record with empty SDS fields.
+    Returns the assigned label. The record will appear in Needs Review
+    immediately because every SDS value is missing.
+    """
+    base = _slugify(input_query)
+    conn = _connect()
+    label = _unique_label(conn, base)
+    row: dict = {
+        "label": label,
+        "input_query": input_query,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "needs_review": "",
+        "review_reasons": "",
+        "ndc": "",
+        "product_name": product_name,
+        "generic_name": "",
+        "manufacturer": "",
+        "dosage_form": "",
+        "dailymed_url": "",
+    }
+    for fname in SDSExtraction.model_fields.keys():
+        row[fname] = ""
+        row[f"{fname}_confidence"] = None
+        row[f"{fname}_evidence"] = ""
+        row[f"{fname}_source"] = ""
+    needs, reasons = _compute_review_status(row)
+    row["needs_review"] = needs
+    row["review_reasons"] = reasons
+    cols = list(row.keys())
+    placeholders = ",".join(["?"] * len(cols))
+    col_sql = ",".join(f'"{c}"' for c in cols)
+    conn.execute(
+        f'INSERT INTO products ({col_sql}) VALUES ({placeholders})',
+        [_clean(row[c]) for c in cols],
+    )
+    _commit(conn)
+    return label
+
+
 def list_records() -> pd.DataFrame:
     conn = _connect()
     cur = conn.execute('SELECT * FROM products ORDER BY saved_at DESC')

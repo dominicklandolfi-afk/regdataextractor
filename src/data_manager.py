@@ -132,8 +132,10 @@ def _render_needs_review(df: pd.DataFrame) -> None:
                     ),
                     "Confidence": st.column_config.NumberColumn(disabled=True, width="small"),
                     "Evidence": st.column_config.TextColumn(disabled=True, width="large"),
-                    "Source": st.column_config.LinkColumn(
-                        disabled=True, display_text=r"https?://([^/]+)/.*", width="small"
+                    "Source": st.column_config.TextColumn(
+                        disabled=True,
+                        help="May contain multiple URLs separated by '; '.",
+                        width="medium",
                     ),
                 },
             )
@@ -199,7 +201,12 @@ def render() -> None:
 
     st.divider()
     st.subheader("All saved records")
-    st.caption("Search, filter, and edit. The 'label' column is the primary key (read-only here — use the SQL pane to rename a record).")
+    st.caption(
+        "Browse, select, and delete records. Use the Needs Review pane "
+        "above for inline edits, or the SQL pane for bulk changes. The "
+        "table toolbar (top right of the table) has built-in search and "
+        "column-header sort."
+    )
 
     essentials = (
         ["label", "input_query", "product_name", "needs_review", "manufacturer", "dosage_form"]
@@ -208,123 +215,100 @@ def render() -> None:
     essentials = [c for c in essentials if c in df.columns]
     all_cols = list(df.columns)
 
-    fcol1, fcol2 = st.columns([2, 2])
-    with fcol1:
-        search = st.text_input(
-            "Search",
-            placeholder="e.g. ibuprofen, UN1950, hoboken",
-            key="dm_search",
-            help="Matches anywhere in any column.",
-        ).strip()
-    with fcol2:
-        col_filter = st.selectbox(
-            "Filter column",
-            options=["(no column filter)"] + all_cols,
-            key="dm_filter_col",
-        )
-
-    filter_value = ""
-    if col_filter and col_filter != "(no column filter)":
-        filter_value = st.text_input(
-            f"Match in `{col_filter}`",
-            placeholder="e.g. Aerosol, YES, Pfizer",
-            key="dm_filter_val",
-        ).strip()
-
-    filtered = df.copy()
-    if search:
-        mask = filtered.astype(str).apply(
-            lambda col: col.str.contains(search, case=False, na=False, regex=False)
-        ).any(axis=1)
-        filtered = filtered[mask]
-    if filter_value:
-        s = filtered[col_filter].astype(str)
-        filtered = filtered[s.str.contains(filter_value, case=False, na=False, regex=False)]
-
-    ccol1, ccol2 = st.columns([3, 1])
-    with ccol1:
+    top_left, top_right = st.columns([1, 3])
+    with top_left:
+        with st.popover("Add row"):
+            with st.form("add_row_form", clear_on_submit=True):
+                st.markdown("**Add a manual record**")
+                new_query = st.text_input(
+                    "Product / input query",
+                    placeholder="e.g. albuterol HFA 90mcg",
+                )
+                new_pname = st.text_input(
+                    "Product name (optional)",
+                    placeholder="ProAir HFA",
+                )
+                submitted = st.form_submit_button("Add", type="primary")
+                if submitted:
+                    if not new_query.strip():
+                        st.error("Product / input query is required.")
+                    else:
+                        new_label = storage.add_blank_record(
+                            new_query.strip(), new_pname.strip()
+                        )
+                        st.success(
+                            f"Added '{new_label}'. Open the Needs Review pane "
+                            f"to fill in the SDS fields."
+                        )
+                        st.rerun()
+    with top_right:
         visible = st.multiselect(
             "Show columns",
             options=all_cols,
             default=st.session_state.get("dm_visible_cols", essentials),
             key="dm_visible_cols",
+            label_visibility="collapsed",
         )
-    with ccol2:
-        st.write("")  # spacer to align with the multiselect label
-        if st.button("Show all columns"):
-            st.session_state["dm_visible_cols"] = all_cols
-            st.rerun()
-        if st.button("Reset to essentials"):
-            st.session_state["dm_visible_cols"] = essentials
-            st.rerun()
 
     if not visible:
         visible = essentials
     if "label" not in visible:
         visible = ["label"] + visible
 
-    st.caption(
-        f"Showing {len(filtered)} of {len(df)} records, "
-        f"{len(visible)} of {len(all_cols)} columns."
-    )
+    if st.button("Show all columns"):
+        st.session_state["dm_visible_cols"] = all_cols
+        st.rerun()
 
-    view = filtered[visible]
-    edited = st.data_editor(
+    st.caption(f"{len(visible)} of {len(all_cols)} columns shown.")
+
+    view = df[visible].reset_index(drop=True)
+    event = st.dataframe(
         view,
         use_container_width=True,
-        num_rows="fixed",
         height=420,
-        key="data_manager_editor",
-        column_config={
-            "label": st.column_config.TextColumn(disabled=True),
-        },
+        hide_index=True,
+        selection_mode="multi-row",
+        on_select="rerun",
+        key="data_manager_dataframe",
     )
 
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        if st.button("Save edits", type="primary"):
-            try:
-                merged = df.set_index("label").copy()
-                e_idx = edited.set_index("label")
-                for col in visible:
-                    if col == "label" or col not in merged.columns:
-                        continue
-                    merged.loc[e_idx.index, col] = e_idx[col]
-                merged = merged.reset_index()
-                count = storage.replace_table(merged)
-                st.success(f"Saved {count} record(s).")
+    selected_indices = list(getattr(event.selection, "rows", []) or [])
+    selected_labels = view.iloc[selected_indices]["label"].tolist() if selected_indices else []
+
+    action_col, download_col = st.columns([1, 2])
+    with action_col:
+        if selected_labels:
+            if st.button(
+                f"Delete {len(selected_labels)} selected row"
+                + ("s" if len(selected_labels) != 1 else ""),
+                type="primary",
+            ):
+                removed = storage.delete_records(selected_labels)
+                st.success(f"Deleted {removed} record(s).")
                 st.rerun()
-            except Exception as exc:
-                st.error(f"Save failed: {exc}")
+        else:
+            st.caption("Select rows in the table to enable deletion.")
 
-    with col2:
-        labels_to_delete = st.multiselect(
-            "Delete labels",
-            options=filtered["label"].tolist(),
-            key="delete_labels",
-        )
-        if st.button("Delete selected", disabled=not labels_to_delete):
-            removed = storage.delete_records(labels_to_delete)
-            st.success(f"Deleted {removed} record(s).")
-            st.rerun()
-
-    with col3:
+    with download_col:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_df = filtered[visible]
+        export_df = view
         buf = BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             export_df.to_excel(writer, sheet_name="Saved Records", index=False)
         buf.seek(0)
-        st.download_button(
-            label="Download xlsx (current view)",
-            data=buf,
-            file_name=f"saved_extractions_{ts}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        csv = export_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download csv (current view)",
-            data=csv,
-            file_name=f"saved_extractions_{ts}.csv",
-            mime="text/csv",
-        )
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            st.download_button(
+                label="Download xlsx (current view)",
+                data=buf,
+                file_name=f"saved_extractions_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with dcol2:
+            csv = export_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download csv (current view)",
+                data=csv,
+                file_name=f"saved_extractions_{ts}.csv",
+                mime="text/csv",
+            )

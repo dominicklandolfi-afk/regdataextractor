@@ -36,7 +36,9 @@ paraphrase or add words. If the schema field describes allowed values \
 the SDS section number when relevant (e.g., "Section 9: Boiling Point: \
 >200 C").
 - Set source_url to the actual SDS PDF URL or DailyMed page, not a search \
-results page.
+results page. If multiple authoritative sources support the same value \
+(e.g., the SDS plus the DailyMed SPL), separate the URLs with "; " \
+(semicolon-space). One URL is fine when only one source applies.
 - Confidence is 0 to 100. Use:
     90-100 = direct quote from a current manufacturer SDS
     70-89  = stated on DailyMed or distributor SDS
