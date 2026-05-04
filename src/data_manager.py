@@ -215,40 +215,36 @@ def render() -> None:
     essentials = [c for c in essentials if c in df.columns]
     all_cols = list(df.columns)
 
-    top_left, top_right = st.columns([1, 3])
-    with top_left:
-        with st.popover("Add row"):
-            with st.form("add_row_form", clear_on_submit=True):
-                st.markdown("**Add a manual record**")
-                new_query = st.text_input(
-                    "Product / input query",
-                    placeholder="e.g. albuterol HFA 90mcg",
-                )
-                new_pname = st.text_input(
-                    "Product name (optional)",
-                    placeholder="ProAir HFA",
-                )
-                submitted = st.form_submit_button("Add", type="primary")
-                if submitted:
-                    if not new_query.strip():
-                        st.error("Product / input query is required.")
-                    else:
-                        new_label = storage.add_blank_record(
-                            new_query.strip(), new_pname.strip()
-                        )
-                        st.success(
-                            f"Added '{new_label}'. Open the Needs Review pane "
-                            f"to fill in the SDS fields."
-                        )
-                        st.rerun()
-    with top_right:
-        visible = st.multiselect(
-            "Show columns",
-            options=all_cols,
-            default=st.session_state.get("dm_visible_cols", essentials),
-            key="dm_visible_cols",
-            label_visibility="collapsed",
-        )
+    with st.expander("Add row (manual entry)"):
+        with st.form("add_row_form", clear_on_submit=True):
+            new_query = st.text_input(
+                "Product / input query",
+                placeholder="e.g. albuterol HFA 90mcg",
+            )
+            new_pname = st.text_input(
+                "Product name (optional)",
+                placeholder="ProAir HFA",
+            )
+            submitted = st.form_submit_button("Add row", type="primary")
+            if submitted:
+                if not new_query.strip():
+                    st.error("Product / input query is required.")
+                else:
+                    new_label = storage.add_blank_record(
+                        new_query.strip(), new_pname.strip()
+                    )
+                    st.success(
+                        f"Added '{new_label}'. Open the Needs Review pane "
+                        f"above to fill in the SDS fields."
+                    )
+                    st.rerun()
+
+    visible = st.multiselect(
+        "Show columns",
+        options=all_cols,
+        default=st.session_state.get("dm_visible_cols", essentials),
+        key="dm_visible_cols",
+    )
 
     if not visible:
         visible = essentials
