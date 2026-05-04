@@ -70,23 +70,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    page_options = ["Extract", "Data Manager"]
-    if hasattr(st, "segmented_control"):
-        page = st.segmented_control(
-            "Page",
-            options=page_options,
-            default=st.session_state.get("nav_page", "Extract"),
-            label_visibility="collapsed",
-            key="nav_page",
-        )
-    else:
-        page = st.radio(
-            "Page",
-            options=page_options,
-            label_visibility="collapsed",
-            key="nav_page",
-        )
 
 
 def _render_extract() -> None:
@@ -198,7 +181,8 @@ def _render_extract() -> None:
         st.metric("Rows flagged for review", flagged_count)
 
 
-if page == "Extract":
-    _render_extract()
-else:
-    data_manager.render()
+_pages = [
+    st.Page(_render_extract, title="Extract", default=True, url_path="extract"),
+    st.Page(data_manager.render, title="Data Manager", url_path="data-manager"),
+]
+st.navigation(_pages, position="sidebar").run()
