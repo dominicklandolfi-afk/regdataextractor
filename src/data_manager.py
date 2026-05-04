@@ -87,10 +87,12 @@ def _render_needs_review(df: pd.DataFrame) -> None:
             items.append({
                 "label": row["label"],
                 "product_name": row.get("product_name", "") or "",
+                "saved_at": row.get("saved_at", "") or "",
                 "row": row,
                 "critical": crit,
                 "other": other,
             })
+    items.sort(key=lambda x: x["saved_at"], reverse=True)
     items.sort(key=lambda x: (-len(x["critical"]), -len(x["other"])))
 
     st.subheader("Needs review")
@@ -107,12 +109,20 @@ def _render_needs_review(df: pd.DataFrame) -> None:
 
     for item in items:
         crit_n, other_n = len(item["critical"]), len(item["other"])
-        title = (
-            f"{item['label']}"
-            + (f" — {item['product_name']}" if item['product_name'] else "")
-            + f"  |  {crit_n} critical, {other_n} other"
-        )
-        with st.expander(title):
+        ts = ""
+        if item["saved_at"]:
+            try:
+                dt = pd.to_datetime(item["saved_at"])
+                ts = f"{dt.strftime('%b')} {dt.day}, {dt.year} {dt.strftime('%I:%M %p').lstrip('0')}"
+            except (ValueError, TypeError):
+                ts = str(item["saved_at"])
+        title_parts = [item["label"]]
+        if item["product_name"]:
+            title_parts.append(f"— {item['product_name']}")
+        if ts:
+            title_parts.append(f"| {ts}")
+        title_parts.append(f"| {crit_n} critical, {other_n} other")
+        with st.expander(" ".join(title_parts)):
             ordered_fields = item["critical"] + item["other"]
             critical_set = set(item["critical"])
             review_df = _build_review_table(item["row"], ordered_fields, critical_set)
@@ -209,7 +219,7 @@ def render() -> None:
     )
 
     essentials = (
-        ["label", "input_query", "product_name", "needs_review", "manufacturer", "dosage_form"]
+        ["label", "saved_at", "input_query", "product_name", "needs_review", "manufacturer", "dosage_form"]
         + list(SDSExtraction.model_fields.keys())
     )
     essentials = [c for c in essentials if c in df.columns]
@@ -255,9 +265,14 @@ def render() -> None:
         st.session_state["dm_visible_cols"] = all_cols
         st.rerun()
 
-    st.caption(f"{len(visible)} of {len(all_cols)} columns shown.")
+    st.caption(
+        f"{len(df)} record(s), most recent first. "
+        f"{len(visible)} of {len(all_cols)} columns shown."
+    )
 
     view = df[visible].reset_index(drop=True)
+    if "saved_at" in view.columns:
+        view["saved_at"] = pd.to_datetime(view["saved_at"], errors="coerce")
     event = st.dataframe(
         view,
         use_container_width=True,
@@ -266,6 +281,12 @@ def render() -> None:
         selection_mode="multi-row",
         on_select="rerun",
         key="data_manager_dataframe",
+        column_config={
+            "saved_at": st.column_config.DatetimeColumn(
+                label="Saved",
+                format="MMM D, YYYY h:mm A",
+            ),
+        },
     )
 
     selected_indices = list(getattr(event.selection, "rows", []) or [])
