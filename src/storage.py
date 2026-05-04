@@ -98,6 +98,17 @@ def _connect():
     return conn
 
 
+def _commit(conn) -> None:
+    """Best-effort commit. libSQL remote connections run in autocommit mode
+    and raise ValueError on conn.commit(); the INSERT is already persisted
+    so we can safely ignore that.
+    """
+    try:
+        conn.commit()
+    except (ValueError, sqlite3.Error):
+        pass
+
+
 def _ensure_schema(conn) -> None:
     col_defs = []
     for col in all_columns():
@@ -115,7 +126,7 @@ def _ensure_schema(conn) -> None:
         if col not in existing:
             col_type = "INTEGER" if col.endswith("_confidence") else "TEXT"
             conn.execute(f'ALTER TABLE products ADD COLUMN "{col}" {col_type}')
-    conn.commit()
+    _commit(conn)
 
 
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9_\- ]+")
@@ -183,7 +194,7 @@ def save_record(record: ProductRecord) -> str:
         f'INSERT INTO products ({col_sql}) VALUES ({placeholders})',
         [_clean(row[c]) for c in cols],
     )
-    conn.commit()
+    _commit(conn)
     return label
 
 
@@ -208,7 +219,7 @@ def delete_records(labels: Iterable[str]) -> int:
     cur = conn.execute(
         f'DELETE FROM products WHERE label IN ({placeholders})', labels
     )
-    conn.commit()
+    _commit(conn)
     return cur.rowcount
 
 
@@ -238,7 +249,7 @@ def replace_table(df: pd.DataFrame) -> int:
         f'INSERT INTO products ({col_sql}) VALUES ({placeholders})',
         rows,
     )
-    conn.commit()
+    _commit(conn)
     return len(df)
 
 
@@ -258,9 +269,9 @@ def run_sql(sql: str) -> tuple[Optional[pd.DataFrame], int, Optional[str]]:
         if cur.description is not None:
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
-            conn.commit()
+            _commit(conn)
             return pd.DataFrame(rows, columns=cols), len(rows), None
-        conn.commit()
+        _commit(conn)
         return None, cur.rowcount, None
     except (sqlite3.Error, Exception) as exc:
         return None, 0, str(exc)
