@@ -221,3 +221,9 @@ class ProductRecord(BaseModel):
     sds: Optional[SDSExtraction] = None
     needs_review: bool = False
     review_reasons: list[str] = Field(default_factory=list)
+    sources: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Per-field provenance: maps SDS field name to the list "
+                    "of sources that contributed (e.g., ['perplexity', 'dot']). "
+                    "Populated by the orchestrator after cross-source enrichment.",
+    )

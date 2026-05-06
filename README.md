@@ -1,15 +1,25 @@
-# RX Regulatory Data Extractor
+# Regulatory Data Extractor
 
-Automates the extraction of regulatory and safety data for prescription
-pharmaceutical products. Looks each product up in DailyMed, finds its
-Safety Data Sheet via Perplexity AI, and fills in the dropdown fields
-required by the regulatory portal (transport classification, flash point,
-pH, water solubility, RCRA classification, etc.).
+Automates the extraction of regulatory and safety data for pharmaceutical
+products (prescription and OTC). Each product is reconciled across four
+sources:
+
+- **DailyMed** for identity and active ingredients (deterministic lookup)
+- **Perplexity** for the Safety Data Sheet (transport classification,
+  flash point, pH, water solubility, RCRA, etc.)
+- **PubChem** for active-ingredient physical properties, cross-checked
+  against the SDS values
+- **49 CFR 172.101** for transport classification, used to confirm or
+  correct the UN number, proper shipping name, hazard class, and packing
+  group
 
 Every extracted value comes with a 0 to 100 confidence score, a direct
-evidence quote from the source, and a link to the source URL. Rows where
-any critical field has confidence below 60 are auto-flagged for human
-review.
+evidence quote, a source URL, and the list of databases that contributed.
+Source agreement raises confidence (typically to 90+); disagreement either
+corrects the value (when 49 CFR contradicts Perplexity on transport) or
+flags the row for review (when PubChem contradicts the SDS on flash
+point for the active ingredient). Rows where any critical field has
+confidence below 60 are auto-flagged for review.
 
 ## What it produces
 
@@ -86,7 +96,12 @@ rx-regulatory-extractor/
     schema.py             Pydantic models with all portal dropdown enums
     dailymed.py           DailyMed REST API client
     perplexity.py         Perplexity sonar-pro client with json_schema
-    extractor.py          Orchestrator + flat-dict serializer
+    pubchem.py            PubChem PUG REST + PUG VIEW client
+    dot_hazmat.py         49 CFR 172.101 lookup table
+    extractor.py          Orchestrator + cross-source reconciliation
+    storage.py            SQLite / Turso persistence
+    data_manager.py       Streamlit page: saved records and edit
+    report_builder.py     Streamlit page: preset reports and SQL
   output/                 (xlsx files land here when downloaded)
 ```
 

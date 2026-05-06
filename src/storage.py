@@ -23,7 +23,12 @@ from typing import Any, Iterable, Optional
 
 import pandas as pd
 
-from .extractor import CONFIDENCE_THRESHOLD, to_flat_dict
+from .extractor import (
+    CONFIDENCE_THRESHOLD,
+    TRANSPORT_DETAIL_FIELDS,
+    is_non_hazmat,
+    to_flat_dict,
+)
 from .schema import ProductRecord, SDSExtraction
 
 
@@ -31,9 +36,21 @@ def _compute_review_status(row) -> tuple[str, str]:
     """Single source of truth for needs_review and review_reasons.
     A field counts as a gap when its value is empty/None or its confidence
     is below the threshold. Operates on either a dict or a pandas Series.
+
+    Transport detail fields (UN number, shipping name, hazard class,
+    packing group) are skipped when transport_regulated says the product
+    is not regulated; an empty value there is the correct answer, not a gap.
     """
     reasons: list[str] = []
+    transport_value = row.get("transport_regulated", "")
+    if isinstance(transport_value, float) and math.isnan(transport_value):
+        transport_value = ""
+    non_hazmat = is_non_hazmat(str(transport_value or ""))
+    transport_detail = set(TRANSPORT_DETAIL_FIELDS)
+
     for fname in SDSExtraction.model_fields.keys():
+        if non_hazmat and fname in transport_detail:
+            continue
         value = row.get(fname, "")
         if (
             value is None
@@ -80,6 +97,7 @@ def _sds_columns() -> tuple[str, ...]:
         cols.append(f"{fname}_confidence")
         cols.append(f"{fname}_evidence")
         cols.append(f"{fname}_source")
+        cols.append(f"{fname}_sources")
     return tuple(cols)
 
 
@@ -196,6 +214,7 @@ def _record_to_row(record: ProductRecord, label: str) -> dict:
             row[f"{fname}_confidence"] = field.get("confidence")
             row[f"{fname}_evidence"] = field.get("evidence_quote") or ""
             row[f"{fname}_source"] = field.get("source_url") or ""
+            row[f"{fname}_sources"] = ", ".join(record.sources.get(fname, []))
     needs, reasons = _compute_review_status(row)
     row["needs_review"] = needs
     row["review_reasons"] = reasons
@@ -257,6 +276,7 @@ def add_blank_record(input_query: str, product_name: str = "") -> str:
         row[f"{fname}_confidence"] = None
         row[f"{fname}_evidence"] = ""
         row[f"{fname}_source"] = ""
+        row[f"{fname}_sources"] = ""
     needs, reasons = _compute_review_status(row)
     row["needs_review"] = needs
     row["review_reasons"] = reasons

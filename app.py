@@ -1,4 +1,4 @@
-"""Streamlit web UI for the RX Regulatory Data Extractor.
+"""Streamlit web UI for the Regulatory Data Extractor.
 
 Run with:
     streamlit run app.py
@@ -16,11 +16,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src import data_manager, storage
+from src import data_manager, report_builder, storage
 from src.extractor import extract_batch, to_flat_dict
 
 st.set_page_config(
-    page_title="RX Regulatory Data Extractor",
+    page_title="Regulatory Data Extractor",
     page_icon=None,
     layout="wide",
 )
@@ -42,7 +42,7 @@ def _password_gate() -> None:
         return
     if st.session_state.get("auth_ok"):
         return
-    st.title("RX Regulatory Data Extractor")
+    st.title("Regulatory Data Extractor")
     st.caption("Internal demo. Enter the access password to continue.")
     pw = st.text_input("Password", type="password", key="_pw_input")
     if pw:
@@ -73,13 +73,24 @@ st.markdown(
 
 
 def _render_extract() -> None:
-    st.title("RX Regulatory Data Extractor")
+    st.title("Regulatory Data Extractor")
     st.caption(
-        "Looks up prescription pharmaceutical products in DailyMed, finds the "
-        "Safety Data Sheet via Perplexity, and extracts the regulatory fields "
-        "from the portal spec sheet. Each value is returned with a confidence "
-        "score, an evidence quote, and a source URL. Results are auto-saved "
-        "to the Data Manager."
+        "Looks up pharmaceutical products (prescription and OTC) across four "
+        "sources and reconciles the results: **DailyMed** for product identity "
+        "and active ingredients, **Perplexity** for the Safety Data Sheet, "
+        "**PubChem** for active-ingredient physical properties (cross-checked "
+        "against the SDS), and **49 CFR 172.101** for transport classification. "
+        "Each value is returned with a confidence score, an evidence quote, a "
+        "source URL, and the list of databases that contributed. Agreement "
+        "between sources raises confidence; disagreement flags the row for "
+        "review. Results are auto-saved to the Data Manager."
+    )
+
+    st.caption(
+        "Empty transport rows (UN number, hazard class, packing group) on an "
+        "oral tablet, capsule, or liquid are correct, not missing. The DOT "
+        "table only applies to regulated products such as aerosols and "
+        "flammable liquids."
     )
 
     st.caption(
@@ -184,5 +195,6 @@ def _render_extract() -> None:
 _pages = [
     st.Page(_render_extract, title="Extract", default=True, url_path="extract"),
     st.Page(data_manager.render, title="Data Manager", url_path="data-manager"),
+    st.Page(report_builder.render, title="Report Builder", url_path="report-builder"),
 ]
 st.navigation(_pages, position="sidebar").run()
