@@ -457,13 +457,8 @@ def render() -> None:
     selected_indices = list(getattr(event.selection, "rows", []) or [])
     selected_labels = view.iloc[selected_indices]["label"].tolist() if selected_indices else []
 
-    st.caption(
-        "Tip: select a single row, then click **Open record** to view and "
-        "edit every field in a scrollable detail panel."
-    )
-
-    action_col, view_col, download_col = st.columns([1, 1, 2])
-    with action_col:
+    delete_col, view_col, download_col = st.columns([1, 1, 2])
+    with delete_col:
         if selected_labels:
             if st.button(
                 f"Delete {len(selected_labels)} selected row"
@@ -474,16 +469,21 @@ def render() -> None:
                 st.success(f"Deleted {removed} record(s).")
                 st.rerun()
         else:
-            st.caption("Select rows in the table to enable deletion.")
+            st.caption("Select rows to enable Delete and View all fields.")
     with view_col:
         if len(selected_labels) == 1:
-            if st.button(f"Open record: {selected_labels[0]}"):
+            if st.button(
+                "View all fields",
+                help="Open a scrollable detail panel showing every field on this record. Edits are saved on Save Changes.",
+            ):
                 st.session_state["dialog_label"] = selected_labels[0]
                 st.rerun()
         elif len(selected_labels) > 1:
-            st.caption("Select exactly one row to open the detail panel.")
-        else:
-            st.caption("")
+            st.button(
+                "View all fields",
+                disabled=True,
+                help="Select exactly one row to view its full detail.",
+            )
 
     with download_col:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
