@@ -94,11 +94,15 @@ def _render_extract() -> None:
     )
 
     st.caption(
-        "Paste one product per line. Use NDC numbers (e.g., `0067-1086-30`) "
-        "or product names (e.g., `atorvastatin`). NDCs are more accurate."
+        "Paste one product per line. Accepts NDC numbers "
+        "(e.g., `0067-1086-30`), brand names (e.g., `NyQuil`, "
+        "`Excedrin`), or generic names (e.g., `acetaminophen`, "
+        "`atorvastatin calcium`, `acetaminophen, dextromethorphan, "
+        "doxylamine`). NDCs are most accurate. Filler words like 'pill', "
+        "'tablet', 'liquid', or 'medicine' are stripped automatically."
     )
 
-    sample_queries = ["atorvastatin", "sertraline", "ibuprofen"]
+    sample_queries = ["atorvastatin", "NyQuil", "acetaminophen, aspirin, caffeine"]
     if st.button("Load 3 sample products"):
         st.session_state["product_input"] = "\n".join(sample_queries)
 
@@ -106,7 +110,7 @@ def _render_extract() -> None:
         "Products to research",
         value=st.session_state.get("product_input", ""),
         height=180,
-        placeholder="atorvastatin\nsertraline\nibuprofen",
+        placeholder="atorvastatin\nNyQuil\nacetaminophen, aspirin, caffeine",
         key="product_input",
         label_visibility="collapsed",
     )

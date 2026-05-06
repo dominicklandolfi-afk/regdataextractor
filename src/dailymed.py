@@ -27,6 +27,69 @@ def _is_ndc(query: str) -> bool:
     return cleaned.isdigit() and len(cleaned) in (10, 11)
 
 
+# Words a non-expert user is likely to type alongside a drug name that
+# DailyMed's drug_name parameter does not understand. Stripping these
+# turns "NyQuil pill form medicine" -> "NyQuil" and "Excedrin tablets" ->
+# "Excedrin", both of which DailyMed matches. Conservative on purpose: we
+# do NOT strip "extra strength", "PM", "max", etc. because those carry
+# real meaning for finding the right SPL.
+QUERY_NOISE_WORDS = frozenset({
+    "pill", "pills", "tablet", "tablets", "capsule", "capsules",
+    "softgel", "softgels", "gelcap", "gelcaps", "liquicap", "liquicaps",
+    "caplet", "caplets",
+    "liquid", "liquids", "syrup", "solution", "suspension", "elixir",
+    "cream", "ointment", "lotion", "foam", "paste", "gel",
+    "spray", "aerosol", "inhaler", "inhalation",
+    "patch", "patches", "powder", "powders", "drops", "drop",
+    "injection", "injectable", "suppository", "lozenge",
+    "form", "forms", "medicine", "medicines", "medication",
+    "medications", "drug", "drugs", "product", "products",
+    "pharmaceutical", "pharmaceuticals",
+    "otc", "brand", "generic", "prescription", "rx",
+})
+
+
+def _sanitize_query(query: str) -> str:
+    """Strip filler words a user might type alongside the drug name.
+    Returns the original query if sanitization would empty it."""
+    if not query:
+        return query
+    tokens = query.split()
+    kept = [t for t in tokens if t.lower().strip(".,;:!?") not in QUERY_NOISE_WORDS]
+    cleaned = " ".join(kept).strip()
+    return cleaned or query
+
+
+def _build_search_candidates(query: str) -> list[str]:
+    """Order DailyMed search candidates from most-specific to most-permissive.
+
+    1. The raw query (what the user typed).
+    2. The sanitized query with noise words stripped.
+    3. The first significant token from the sanitized query.
+
+    Duplicates and short fragments are filtered. The first hit wins."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        v = (value or "").strip()
+        if not v:
+            return
+        key = v.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(v)
+
+    _add(query)
+    _add(_sanitize_query(query))
+    sanitized = _sanitize_query(query)
+    tokens = sanitized.split()
+    if tokens and len(tokens[0]) >= 3:
+        _add(tokens[0])
+    return candidates
+
+
 DOSAGE_FORM_KEYWORDS = (
     "TABLET", "CAPSULE", "SOLUTION", "INJECTION", "INJECTABLE",
     "CREAM", "OINTMENT", "PATCH", "LOTION", "AEROSOL", "SPRAY",
@@ -134,9 +197,23 @@ def fetch_ndcs(setid: str) -> list[str]:
 
 
 def lookup(query: str) -> DailyMedData:
-    """High-level lookup: search and assemble DailyMedData."""
+    """High-level lookup: search and assemble DailyMedData.
+
+    Tries several progressively-cleaner versions of the user's query so
+    that brand names typed alongside dosage forms ('NyQuil pill form
+    medicine') still resolve. NDC queries skip sanitization."""
     record = DailyMedData()
-    hit = search_spl(query)
+
+    if _is_ndc(query):
+        candidates = [query]
+    else:
+        candidates = _build_search_candidates(query)
+
+    hit = None
+    for candidate in candidates:
+        hit = search_spl(candidate)
+        if hit:
+            break
     if not hit:
         return record
 
