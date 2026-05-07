@@ -133,17 +133,29 @@ def _enrich_pubchem(
     sources: dict[str, list[str]],
     extra_review: list[str],
 ) -> None:
-    """Cross-reference each active ingredient against the SDS values."""
+    """Cross-reference each active ingredient against the SDS values.
+
+    PubChem coverage varies by compound: aspirin has flash point data;
+    acetaminophen and caffeine do not. When some ingredients have data
+    and others don't, the evidence string makes this explicit so the
+    reviewer knows we looked them up rather than skipped them.
+    """
+    queried = [r for r in pubchem_records if r.cid is not None]
     informative = [r for r in pubchem_records if r.has_any()]
-    if not informative:
+    if not queried:
         return
+
+    queried_names = ", ".join(r.name for r in queried if r.name)
 
     # Flash point: aggregate across ingredients. Any False (clear conflict)
     # demotes confidence and flags the row. All True means cross-confirmed.
     flash_evidence: list[str] = []
     flash_decisions: list[Optional[bool]] = []
-    for rec in informative:
+    flash_missing: list[str] = []
+    for rec in queried:
         if not rec.flash_point_text:
+            if rec.name:
+                flash_missing.append(rec.name)
             continue
         decision = pubchem.flash_point_agreement(
             sds.flash_point_c.value, rec.flash_point_text
@@ -153,6 +165,21 @@ def _enrich_pubchem(
             f"{rec.name}: {rec.flash_point_text}"
             + (f" ({rec.compound_url})" if rec.compound_url else "")
         )
+
+    if flash_evidence or flash_missing:
+        coverage_note = (
+            f"checked {len(queried)} active ingredient"
+            f"{'s' if len(queried) != 1 else ''} ({queried_names})"
+        )
+        if flash_evidence and flash_missing:
+            coverage_note += (
+                f"; flash point data in PubChem for: "
+                f"{', '.join(r.name for r in queried if r.flash_point_text and r.name)}"
+                f"; no flash point data for: {', '.join(flash_missing)}"
+            )
+        elif flash_missing and not flash_evidence:
+            coverage_note += "; PubChem has no flash point data for any of them"
+
     if flash_evidence:
         joined = "; ".join(flash_evidence)
         if any(d is False for d in flash_decisions):
@@ -160,8 +187,8 @@ def _enrich_pubchem(
             sds.flash_point_c.confidence = min(sds.flash_point_c.confidence, 50)
             sds.flash_point_c.evidence_quote = _append_evidence(
                 sds.flash_point_c.evidence_quote,
-                f"PubChem flash points for active ingredients ({joined}) "
-                f"disagree with the SDS value. Verify on the manufacturer SDS.",
+                f"PubChem ({coverage_note}): {joined}. "
+                f"Disagrees with the SDS value; verify on the manufacturer SDS.",
             )
             extra_review.append(
                 "flash_point_c: PubChem disagrees with SDS for at least one active ingredient"
@@ -171,15 +198,19 @@ def _enrich_pubchem(
             sds.flash_point_c.confidence = max(sds.flash_point_c.confidence, 90)
             sds.flash_point_c.evidence_quote = _append_evidence(
                 sds.flash_point_c.evidence_quote,
-                f"PubChem flash points for active ingredients ({joined}) "
-                f"are consistent with the SDS value.",
+                f"PubChem ({coverage_note}): {joined}. "
+                f"Consistent with the SDS value.",
             )
         else:
             sds.flash_point_c.evidence_quote = _append_evidence(
                 sds.flash_point_c.evidence_quote,
-                f"PubChem flash points (informational, may differ from "
-                f"formulation): {joined}.",
+                f"PubChem ({coverage_note}, informational): {joined}.",
             )
+    elif flash_missing:
+        sds.flash_point_c.evidence_quote = _append_evidence(
+            sds.flash_point_c.evidence_quote,
+            f"PubChem {coverage_note}.",
+        )
 
     # Boiling, solubility, pH: informational citations per ingredient.
     for fname, attr in (
