@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src import data_manager, report_builder, storage
+from src import data_manager, data_quality, report_builder, storage
 from src.extractor import extract_batch, to_flat_dict
 
 st.set_page_config(
@@ -200,5 +200,6 @@ _pages = [
     st.Page(_render_extract, title="Extract", default=True, url_path="extract"),
     st.Page(data_manager.render, title="Data Manager", url_path="data-manager"),
     st.Page(report_builder.render, title="Report Builder", url_path="report-builder"),
+    st.Page(data_quality.render, title="Data Quality", url_path="data-quality"),
 ]
 st.navigation(_pages, position="sidebar").run()

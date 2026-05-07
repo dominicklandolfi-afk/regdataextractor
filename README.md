@@ -75,15 +75,71 @@ Download as xlsx or csv.
 | Field source | Method | Typical confidence |
 |---|---|---|
 | Product Name, Generic Name, NDC, Manufacturer, Dosage Form | DailyMed REST API | n/a (deterministic) |
-| Product Type, Physical State | Inferred from dosage form | 80 |
-| Flash Point, Boiling Point, pH, Water Solubility | Perplexity searches manufacturer SDS | 70 to 95 if SDS found, 40 to 60 if defaulted |
-| Transport Classification, UN Number, Hazard Class | Perplexity + dosage form rules | 80 for non-aerosol tablets, 90+ for aerosols with confirmed SDS |
+| Product Type, Physical State | Perplexity, validated against DailyMed dosage form | 80 to 95 when consistent, demoted to 50 on mismatch |
+| Flash Point, Boiling Point, pH, Water Solubility | Perplexity searches manufacturer SDS, cross-checked against PubChem | 70 to 95 if SDS found and PubChem agrees, 50 if PubChem disagrees, 40 to 60 if defaulted |
+| Transport Classification, UN Number, Hazard Class | Perplexity + 49 CFR 172.101 lookup | 95 when DOT confirms or corrects, 90 for derived "Not Applicable" on non-hazmat, 80 default |
 | RCRA Classification | Perplexity + flammability check | 80 default, 90+ with SDS |
 
 Anything below confidence 60 on a critical field flags the row for human
 review. The reviewer can read the evidence quote, click the source URL,
 and either accept the AI value or correct it before final import to the
 portal.
+
+## Expected accuracy
+
+Based on a panel of 8 representative products covering Rx tablets, OTC
+tablets, combination products, OTC liquids with filler-word queries,
+topical ointments, topical creams, aerosol inhalers, and alcohol-
+containing mouthwash:
+
+- **DailyMed identity**: ~99% (deterministic API, fails only when
+  the product is missing from DailyMed entirely or the query returns
+  the wrong SPL — both surfaced explicitly in the Data Quality page).
+- **Product type / physical state**: ~95% on common dosage forms after
+  the dosage-form-mapping prompt and consistency check land. Niche
+  forms (kits, transdermal patches, suppositories) drop to ~80%.
+- **Flash point**: ~85% for products where PubChem has the active
+  ingredient. Non-flammable defaults are accurate. PubChem cross-check
+  catches the dangerous case (SDS says "non-flammable" but active
+  ingredient flashes low).
+- **Transport classification**: ~90%. The DOT 172.101 lookup catches
+  Perplexity errors on UN number and hazard class. Edge case: when
+  DailyMed returns the wrong formulation (e.g., "albuterol" returns
+  the nebulizer solution, not the HFA aerosol), classification follows
+  whatever SPL was returned, which may not be what the user wanted.
+- **RCRA**: ~85%. Defaults to "not classified" for non-flammable
+  products, which is correct for the vast majority.
+
+Run the integration sweep yourself any time:
+
+```powershell
+.venv\Scripts\python.exe -m tests.integration_sweep
+```
+
+Costs roughly $0.10 per run in Perplexity API calls.
+
+## Self-checks built into the pipeline
+
+The system flags its own uncertainty automatically:
+
+1. **Dosage form vs physical state mismatch**: if DailyMed says CREAM
+   but Perplexity picks Capsule/Tablet, the row's confidence drops to
+   50 and a review reason is added.
+2. **Transport contradiction**: if Perplexity says "not regulated" but
+   gives a UN number or DailyMed shows an aerosol dosage form, the
+   Not-Applicable normalization is skipped and a review reason is
+   added.
+3. **PubChem flash point disagreement**: if any active ingredient
+   flashes at a temperature that contradicts the SDS claim, flash
+   confidence drops to 50.
+4. **49 CFR 172.101 transport correction**: if Perplexity returned
+   the wrong UN/hazard class for a known UN number, the value is
+   replaced and the source provenance reads "dot (corrected from
+   perplexity)".
+
+The **Data Quality** page in the app surfaces all of these aggregate
+across saved records so you can spot systemic regressions without
+auditing individual rows.
 
 ## Project layout
 
