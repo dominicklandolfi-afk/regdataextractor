@@ -252,18 +252,60 @@ def _enrich_dot(
             )
 
 
+_AEROSOL_DOSAGE_HINTS: tuple[str, ...] = (
+    "AEROSOL", "INHALANT", "INHALATION", "SPRAY",
+    "INHALER", "PROPELLANT",
+)
+
+
+def _looks_regulated(sds: SDSExtraction, dm: Optional[DailyMedData]) -> bool:
+    """Defensive: detect contradictions between transport_regulated and
+    other signals so we don't normalize an aerosol to 'Not Applicable'.
+    Returns True when the product looks regulated regardless of what the
+    transport_regulated dropdown says.
+    """
+    un_value = (sds.un_number.value or "").strip().lower()
+    if un_value and un_value not in {"", "none", "n/a", "na", "not applicable"}:
+        return True
+    shipping = (sds.proper_shipping_name.value or "").strip().lower()
+    if shipping and shipping not in {"", "none", "n/a", "na", "not applicable"}:
+        return True
+    hazard = (sds.hazard_class.value or "").strip()
+    if hazard and hazard not in {"", "Not Applicable"}:
+        return True
+    if dm and dm.dosage_form:
+        dosage = dm.dosage_form.upper()
+        if any(hint in dosage for hint in _AEROSOL_DOSAGE_HINTS):
+            return True
+    return False
+
+
 def _normalize_non_hazmat(
     sds: SDSExtraction,
     sources: dict[str, list[str]],
-) -> None:
-    """When Perplexity (or DOT) determined the product is not regulated for
-    transport, fill the four transport detail fields with an explicit
-    'Not Applicable' answer instead of leaving them empty. An oral tablet
-    or capsule should read as a definitive negative, not a missing-data row.
+    dm: Optional[DailyMedData] = None,
+) -> list[str]:
+    """When Perplexity determined the product is not regulated for transport,
+    fill the four transport detail fields with an explicit 'Not Applicable'
+    answer instead of leaving them empty. An oral tablet or capsule should
+    read as a definitive negative, not a missing-data row.
+
+    Defensive: if any other signal contradicts the non-regulated claim
+    (a UN number is present, dosage form is an aerosol, etc.), skip
+    normalization and return a review reason so the human can resolve
+    the conflict.
     """
     transport_value = (sds.transport_regulated.value or "").strip()
     if transport_value not in TRANSPORT_NOT_REGULATED:
-        return
+        return []
+
+    if _looks_regulated(sds, dm):
+        return [
+            "transport_regulated says 'not regulated' but other signals "
+            "(UN number, hazard class, or aerosol dosage form) suggest the "
+            "product IS regulated for transport - verify transport status"
+        ]
+
     for fname, default_value in NON_HAZMAT_DEFAULTS.items():
         field = getattr(sds, fname)
         current = (field.value or "").strip()
@@ -277,12 +319,14 @@ def _normalize_non_hazmat(
                 f"hazard class, or packing group.",
             )
             sources[fname] = list(dict.fromkeys(sources.get(fname, []) + ["derived"]))
+    return []
 
 
 def _enrich(
     sds: SDSExtraction,
     pubchem_records: list[pubchem.PubChemData],
     dot_entry: Optional[dot_hazmat.DOTEntry],
+    dm: Optional[DailyMedData] = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Mutate sds with cross-source enrichment. Return (sources_map, extra_review)."""
     sources: dict[str, list[str]] = {
@@ -295,7 +339,8 @@ def _enrich(
     if dot_entry is not None:
         _enrich_dot(sds, dot_entry, sources, extra_review)
 
-    _normalize_non_hazmat(sds, sources)
+    contradiction_reasons = _normalize_non_hazmat(sds, sources, dm)
+    extra_review.extend(contradiction_reasons)
 
     return sources, extra_review
 
@@ -345,7 +390,7 @@ def extract_product(query: str) -> ProductRecord:
         hazard_class_hint=hazard_hint or None,
     )
 
-    sources_map, extra_review = _enrich(sds, pubchem_records, dot_entry)
+    sources_map, extra_review = _enrich(sds, pubchem_records, dot_entry, dm)
 
     needs_review, reasons = _evaluate_review(sds)
     if extra_review:

@@ -25,6 +25,7 @@ import pandas as pd
 
 from .extractor import (
     CONFIDENCE_THRESHOLD,
+    CRITICAL_FIELDS,
     TRANSPORT_DETAIL_FIELDS,
     is_non_hazmat,
     to_flat_dict,
@@ -34,40 +35,53 @@ from .schema import ProductRecord, SDSExtraction
 
 def _compute_review_status(row) -> tuple[str, str]:
     """Single source of truth for needs_review and review_reasons.
-    A field counts as a gap when its value is empty/None or its confidence
-    is below the threshold. Operates on either a dict or a pandas Series.
+
+    A row is flagged for review only when one of the five CRITICAL fields
+    has a missing value or a confidence below threshold (product type,
+    physical state, flash point, transport regulated, RCRA classification).
+    Non-critical fields with gaps are listed in the reasons string for
+    visibility but do NOT trigger the review flag, so OTC products with
+    sparse SDS data don't fill the review pane with noise.
 
     Transport detail fields (UN number, shipping name, hazard class,
     packing group) are skipped when transport_regulated says the product
     is not regulated; an empty value there is the correct answer, not a gap.
     """
-    reasons: list[str] = []
+    critical_set = set(CRITICAL_FIELDS)
+    transport_detail = set(TRANSPORT_DETAIL_FIELDS)
+
     transport_value = row.get("transport_regulated", "")
     if isinstance(transport_value, float) and math.isnan(transport_value):
         transport_value = ""
     non_hazmat = is_non_hazmat(str(transport_value or ""))
-    transport_detail = set(TRANSPORT_DETAIL_FIELDS)
+
+    critical_reasons: list[str] = []
+    other_reasons: list[str] = []
 
     for fname in SDSExtraction.model_fields.keys():
         if non_hazmat and fname in transport_detail:
             continue
+        bucket = critical_reasons if fname in critical_set else other_reasons
         value = row.get(fname, "")
         if (
             value is None
             or (isinstance(value, float) and math.isnan(value))
             or str(value).strip() == ""
         ):
-            reasons.append(f"{fname}: missing value")
+            bucket.append(f"{fname}: missing value")
             continue
         conf = row.get(f"{fname}_confidence")
         if conf is None or (isinstance(conf, float) and math.isnan(conf)):
             continue
         try:
             if int(conf) < CONFIDENCE_THRESHOLD:
-                reasons.append(f"{fname}: low confidence ({int(conf)})")
+                bucket.append(f"{fname}: low confidence ({int(conf)})")
         except (ValueError, TypeError):
             pass
-    return ("YES" if reasons else "no", "; ".join(reasons))
+
+    flag = "YES" if critical_reasons else "no"
+    all_reasons = critical_reasons + other_reasons
+    return flag, "; ".join(all_reasons)
 
 LOCAL_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "extractions.db"
 

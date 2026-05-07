@@ -261,10 +261,18 @@ def _render_sds_field(
 
 
 def _render_needs_review(df: pd.DataFrame) -> None:
+    """Lists records flagged for review. A record is flagged only when one
+    of the five CRITICAL fields has a missing value or low confidence
+    (product type, physical state, flash point, transport regulated, RCRA
+    classification). Non-critical gaps are still surfaced inside the
+    expander so the user can fill them in, but they do not push the record
+    into the review queue. This keeps the pane focused on the rows that
+    actually need attention rather than every OTC product with sparse SDS
+    data."""
     items = []
     for _, row in df.iterrows():
         crit, other = _gap_fields(row)
-        if crit or other:
+        if crit:
             items.append({
                 "label": row["label"],
                 "product_name": row.get("product_name", "") or "",
@@ -278,14 +286,19 @@ def _render_needs_review(df: pd.DataFrame) -> None:
 
     st.subheader("Needs review")
     if not items:
-        st.success("All saved records have complete, high-confidence values.")
+        st.success(
+            "No records have critical-field gaps. Use the 'View all fields' "
+            "button below to fill in optional fields on individual records."
+        )
         return
 
     st.caption(
-        f"{len(items)} of {len(df)} record(s) have empty or low-confidence "
-        f"fields (confidence threshold: {CONFIDENCE_THRESHOLD}). Critical fields "
-        "appear first in each record. Edit the Value column inline; saved "
-        "edits are marked confidence 100 (human-verified)."
+        f"{len(items)} of {len(df)} record(s) have a CRITICAL field missing "
+        f"or below confidence {CONFIDENCE_THRESHOLD} (product type, physical "
+        "state, flash point, transport regulated, or RCRA classification). "
+        "Non-critical fields are listed too but do not flag the row. Edit "
+        "the Value column inline; saved edits are marked confidence 100 "
+        "(human-verified)."
     )
 
     for item in items:
