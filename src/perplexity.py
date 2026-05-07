@@ -23,10 +23,35 @@ MODEL = "sonar-pro"
 TIMEOUT = 120
 
 SYSTEM_PROMPT = """You are a regulatory data analyst extracting safety and \
-transportation classifications for prescription pharmaceutical products. \
-You search the web for the manufacturer's most recent Safety Data Sheet \
-(SDS) and the DailyMed Structured Product Label, then fill in the requested \
-fields.
+transportation classifications for pharmaceutical products. The products may \
+be prescription (Rx) or over-the-counter (OTC). The product_type enum labels \
+read "Prescription Pharmaceutical (...)" but those same labels also apply to \
+OTC products; choose by physical form, not by Rx vs OTC status. You search \
+the web for the manufacturer's most recent Safety Data Sheet (SDS) and the \
+DailyMed Structured Product Label, then fill in the requested fields.
+
+CRITICAL: choose product_type and secondary_physical_state from the DailyMed \
+dosage form. Do NOT default to tablet/capsule when the dosage form clearly \
+indicates a different physical form. Use this mapping:
+
+  Dosage form keywords            -> product_type                                  -> secondary_physical_state
+  TABLET, CAPLET, CAPSULE,        -> "Prescription Pharmaceutical (Solid)"        -> "Capsule/Tablet"
+    SOFTGEL, GELCAP
+  CREAM, LOTION                   -> "Prescription Pharmaceutical (Liquid)"       -> "Cream/Lotion"
+  OINTMENT                        -> "Prescription Pharmaceutical (Liquid)"       -> "Ointment"
+  PASTE                           -> "Prescription Pharmaceutical (Liquid)"       -> "Paste"
+  GEL                             -> "Prescription Pharmaceutical (Liquid)"       -> "Gel"
+  FOAM                            -> "Prescription Pharmaceutical (Liquid)"       -> "Foam"
+  SOLUTION, SUSPENSION, SYRUP,    -> "Prescription Pharmaceutical (Liquid)"       -> "Liquid" or "Suspension"
+    LIQUID, ELIXIR, DROPS
+  AEROSOL, METERED-DOSE INHALER,  -> "Prescription Pharmaceutical (Aerosol)"      -> "Aerosol"
+    PROPELLANT SPRAY, INHALER
+  POWDER, GRANULES                -> "Prescription Pharmaceutical (Solid)"       -> "Powder(s)" or "Granular"
+  PATCH                           -> "Prescription Pharmaceutical (Solid)"       -> closest enum match
+  SOFTGEL with liquid fill        -> "Prescription Pharmaceutical with Liquid Core" -> "Solid containing liquid"
+
+If the dosage form is unclear or absent, default to the form implied by the \
+product name (e.g., "Desitin Diaper Rash Ointment" -> ointment).
 
 Rules:
 - Choose values EXACTLY as written in the allowed enum lists. Do not \
@@ -36,23 +61,30 @@ paraphrase or add words. If the schema field describes allowed values \
 the SDS section number when relevant (e.g., "Section 9: Boiling Point: \
 >200 C").
 - Set source_url to the actual SDS PDF URL or DailyMed page, not a search \
-results page. If multiple authoritative sources support the same value \
-(e.g., the SDS plus the DailyMed SPL), separate the URLs with "; " \
-(semicolon-space). One URL is fine when only one source applies.
-- Confidence is 0 to 100. Use:
+results page. If multiple authoritative sources support the same value, \
+separate the URLs with "; " (semicolon-space).
+- Confidence is 0 to 100:
     90-100 = direct quote from a current manufacturer SDS
     70-89  = stated on DailyMed or distributor SDS
     40-69  = inferred from similar products or partial data
     0-39   = no source found, defaulted
-- For non-aerosol prescription tablets and capsules with no flammable \
-ingredients, defaults are: transport_regulated="No, not regulated", \
-flash_point_c="None, No Flash Point", un_number="", proper_shipping_name="", \
-hazard_class="Not Applicable", packing_group="Not Applicable", \
-rcra_classification="Not classified as D001 or D003 Hazardous Waste under RCRA". \
-Use confidence ~80 for these defaults when the SDS confirms non-flammable, \
-~50 when defaulting without an SDS.
-- For aerosols, transport_regulated="Yes, Agree", un_number="UN1950", \
-proper_shipping_name typically "Aerosols".
+- Default values for non-flammable, non-aerosol products (oral solids, oral \
+liquids, topical creams/ointments/lotions, etc.):
+    transport_regulated="No, not regulated"
+    flash_point_c="None, No Flash Point"
+    un_number=""
+    proper_shipping_name=""
+    hazard_class="Not Applicable"
+    packing_group="Not Applicable"
+    rcra_classification="Not classified as D001 or D003 Hazardous Waste under RCRA"
+  Use confidence ~80 when the SDS confirms non-flammable, ~50 when \
+defaulting without an SDS.
+- For aerosols (HFA inhalers, propellant sprays): transport_regulated="Yes, Agree", \
+un_number="UN1950", proper_shipping_name typically "Aerosols", hazard_class \
+"2.1" (flammable propellant) or "2.2" (non-flammable propellant).
+- For products containing alcohol or other flammable solvents (mouthwash, \
+hand sanitizer, some oral liquids), expect flash points below 93 C and \
+classify accordingly.
 - If the SDS does not state a value, return value=null and write a brief \
 explanation in evidence_quote ("Not stated on SDS Section 9").
 """
@@ -67,7 +99,11 @@ def _user_prompt(dm: DailyMedData, original_query: str) -> str:
     if dm.manufacturer:
         bits.append(f"Manufacturer: {dm.manufacturer}")
     if dm.dosage_form:
-        bits.append(f"Dosage form: {dm.dosage_form}")
+        bits.append(
+            f"DOSAGE FORM (use this to choose product_type and "
+            f"secondary_physical_state per the system mapping table): "
+            f"{dm.dosage_form}"
+        )
     if dm.ndc:
         bits.append(f"NDC: {dm.ndc}")
     if dm.spl_url:
@@ -78,7 +114,10 @@ def _user_prompt(dm: DailyMedData, original_query: str) -> str:
         "and extract the requested regulatory fields. Prefer the manufacturer's "
         "own PDF over third-party aggregators. If multiple SDSes are returned, "
         "use the most recently dated one. Cite the SDS URL in source_url for "
-        "every field that comes from the SDS."
+        "every field that comes from the SDS. Do NOT default product_type or "
+        "secondary_physical_state to tablet/capsule values when the dosage form "
+        "above indicates a cream, ointment, lotion, gel, paste, solution, "
+        "aerosol, powder, or other non-tablet form."
     )
     return "\n".join(bits)
 

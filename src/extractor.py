@@ -288,6 +288,58 @@ _AEROSOL_DOSAGE_HINTS: tuple[str, ...] = (
     "INHALER", "PROPELLANT",
 )
 
+# Maps DailyMed dosage form keywords to the secondary_physical_state enum
+# values that are reasonable matches. Used as a sanity check on Perplexity's
+# choice. Each tuple is (keyword in dosage form, allowed enum values).
+_DOSAGE_PHYSICAL_STATE_MAP: tuple[tuple[str, frozenset[str]], ...] = (
+    ("CREAM", frozenset({"Cream/Lotion", "Semi-Solid", "Emulsion"})),
+    ("LOTION", frozenset({"Cream/Lotion", "Liquid", "Emulsion", "Semi-Solid"})),
+    ("OINTMENT", frozenset({"Ointment", "Semi-Solid", "Paste"})),
+    ("PASTE", frozenset({"Paste", "Semi-Solid", "Ointment"})),
+    ("GEL", frozenset({"Gel", "Semi-Solid", "Solid Gel Consistency"})),
+    ("FOAM", frozenset({"Foam"})),
+    (
+        "SOLUTION",
+        frozenset({"Liquid", "Liquid (Sterile Diluent)", "Suspension", "Viscous liquid"}),
+    ),
+    ("SUSPENSION", frozenset({"Suspension", "Liquid", "Viscous liquid"})),
+    ("SYRUP", frozenset({"Liquid", "Viscous liquid"})),
+    ("ELIXIR", frozenset({"Liquid"})),
+    ("DROPS", frozenset({"Liquid"})),
+    (
+        "AEROSOL",
+        frozenset(
+            {"Aerosol", "Liquid spray", "Solid spray", "Pump Spray", "Bag-on-valve (BOV)"}
+        ),
+    ),
+    ("INHALANT", frozenset({"Aerosol", "Inhaler"})),
+    ("INHALER", frozenset({"Inhaler", "Aerosol"})),
+    ("INHALATION", frozenset({"Aerosol", "Inhaler", "Liquid"})),
+    ("SPRAY", frozenset({"Liquid spray", "Solid spray", "Pump Spray", "Aerosol"})),
+    ("POWDER", frozenset({"Powder(s)", "Granular", "Solid, powder"})),
+    ("GRANULES", frozenset({"Granular", "Powder(s)"})),
+    ("TABLET", frozenset({"Capsule/Tablet", "Solid"})),
+    ("CAPSULE", frozenset({"Capsule/Tablet", "Solid containing liquid", "Solid"})),
+    ("CAPLET", frozenset({"Capsule/Tablet", "Solid"})),
+    ("SOFTGEL", frozenset({"Capsule/Tablet", "Solid containing liquid"})),
+    ("PATCH", frozenset({"Solid", "Fabric (no free liquid)"})),
+    ("LIQUID", frozenset({"Liquid", "Suspension", "Viscous liquid"})),
+)
+
+
+def _physical_state_matches_dosage(dosage_form: str, picked_state: str) -> Optional[bool]:
+    """Return True if Perplexity's secondary_physical_state choice is
+    consistent with DailyMed's dosage form. False if there's a clear
+    mismatch (e.g., dosage form is OINTMENT, picked state is Capsule/Tablet).
+    None when the mapping is undefined."""
+    if not dosage_form or not picked_state:
+        return None
+    dosage_upper = dosage_form.upper()
+    for keyword, allowed in _DOSAGE_PHYSICAL_STATE_MAP:
+        if keyword in dosage_upper:
+            return picked_state in allowed
+    return None
+
 
 def _looks_regulated(sds: SDSExtraction, dm: Optional[DailyMedData]) -> bool:
     """Defensive: detect contradictions between transport_regulated and
@@ -353,6 +405,32 @@ def _normalize_non_hazmat(
     return []
 
 
+def _check_dosage_form_consistency(
+    sds: SDSExtraction,
+    dm: Optional[DailyMedData],
+) -> list[str]:
+    """If DailyMed says the product is a CREAM/OINTMENT/etc. but Perplexity
+    picked a tablet-style secondary_physical_state, surface that as a
+    review reason. Catches the failure mode where the model defaulted to
+    'Capsule/Tablet' for a topical."""
+    if not dm or not dm.dosage_form:
+        return []
+    picked = (sds.secondary_physical_state.value or "").strip()
+    if not picked:
+        return []
+    match = _physical_state_matches_dosage(dm.dosage_form, picked)
+    if match is False:
+        # Demote confidence so the review pane picks it up too.
+        sds.secondary_physical_state.confidence = min(
+            sds.secondary_physical_state.confidence, 50
+        )
+        return [
+            f"secondary_physical_state '{picked}' does not match DailyMed "
+            f"dosage form '{dm.dosage_form}' - verify the physical state"
+        ]
+    return []
+
+
 def _enrich(
     sds: SDSExtraction,
     pubchem_records: list[pubchem.PubChemData],
@@ -372,6 +450,8 @@ def _enrich(
 
     contradiction_reasons = _normalize_non_hazmat(sds, sources, dm)
     extra_review.extend(contradiction_reasons)
+
+    extra_review.extend(_check_dosage_form_consistency(sds, dm))
 
     return sources, extra_review
 
