@@ -129,13 +129,17 @@ def _split_title(title: str) -> dict:
 
     upper = work.upper()
     split_at = None
+    # rfind so that titles like "GENTLE CARE KIT (ZINC OXIDE) KIT" (where
+    # the dosage-form keyword also appears in the product name) split on
+    # the LAST occurrence, which is reliably the actual dosage form.
     for kw in DOSAGE_FORM_KEYWORDS:
+        candidate = -1
         for needle in (" " + kw, "\t" + kw):
-            idx = upper.find(needle)
-            if idx >= 0:
-                split_at = idx + 1
-                break
-        if split_at is not None:
+            idx = upper.rfind(needle)
+            if idx > candidate:
+                candidate = idx
+        if candidate >= 0:
+            split_at = candidate + 1
             break
         if upper.startswith(kw):
             split_at = 0
@@ -154,8 +158,37 @@ def _split_title(title: str) -> dict:
     return out
 
 
+def _score_hit(query: str, title: str) -> int:
+    """Higher score = better match. Used to pick the best DailyMed SPL
+    when the API returns multiple hits, some of which don't actually
+    contain the query (e.g., 'Desitin' returning 'GENTLE CARE KIT' as
+    its first hit because the kit happens to bundle Desitin)."""
+    if not title:
+        return 0
+    q = query.strip().lower()
+    t = title.lower()
+    if not q:
+        return 0
+    score = 0
+    if q in t:
+        score += 100
+    # Word-boundary bonus: query appears as its own token, not glued
+    # inside another word.
+    tokens = re.findall(r"[A-Za-z0-9]+", t)
+    q_tokens = re.findall(r"[A-Za-z0-9]+", q)
+    if q_tokens and all(qt in tokens for qt in q_tokens):
+        score += 50
+    # First-token bonus: the query is the first word of the title
+    # (typical for brand-name searches like 'Excedrin').
+    if t.startswith(q):
+        score += 25
+    return score
+
+
 def search_spl(query: str) -> Optional[dict]:
-    """Search DailyMed by NDC or drug name. Returns the first SPL hit or None."""
+    """Search DailyMed by NDC or drug name. Returns the best-matching SPL
+    or None. When the API returns several hits, prefer one whose title
+    actually contains the query string."""
     params = {"pagesize": "5"}
     if _is_ndc(query):
         params["ndc"] = query
@@ -170,7 +203,12 @@ def search_spl(query: str) -> Optional[dict]:
     hits = data.get("data") or []
     if not hits:
         return None
-    return hits[0]
+    if _is_ndc(query):
+        return hits[0]
+    scored = [(idx, _score_hit(query, hit.get("title", "")), hit) for idx, hit in enumerate(hits)]
+    # Highest score first; on tie, original API order wins.
+    scored.sort(key=lambda t: (-t[1], t[0]))
+    return scored[0][2]
 
 
 def fetch_ndcs(setid: str) -> list[str]:
