@@ -194,6 +194,33 @@ TOPICALS_NONFLAM = [
             "transport_regulated": "No, not regulated",
         },
     ),
+    GoldenProduct(
+        query="Flonase",
+        label="Flonase Sensimist pump nasal spray",
+        # Pump spray (not pressurized aerosol) - regulatory profile is
+        # same as a non-flammable topical. Tests classifier doesn't
+        # misroute SPRAY into AEROSOL_PROPELLED.
+        expected_category=ProductCategory.TOPICAL_NONFLAM,
+        expected_dosage_keywords=("SPRAY",),
+        expected_fields={
+            "flash_point_c": "None, No Flash Point",
+        },
+    ),
+    GoldenProduct(
+        query="Bengay",
+        label="Bengay gel with isopropyl alcohol inactive",
+        # Safety-asymmetric regression: classifier categorizes as
+        # TOPICAL_NONFLAM (only menthol active surfaces from DailyMed)
+        # but Perplexity reads the SDS and sees isopropyl alcohol in
+        # the inactives. Safety guard must preserve Perplexity's
+        # flammable flash range.
+        expected_category=ProductCategory.TOPICAL_NONFLAM,
+        expected_dosage_keywords=("GEL", "CREAM", "OINTMENT"),
+        # Don't pin the exact flash range - Perplexity varies between
+        # <23C and >60C and <93C depending on the SKU. Just confirm
+        # the row clears review.
+        expected_fields={},
+    ),
 ]
 
 
@@ -266,6 +293,20 @@ LOZENGES = [
     GoldenProduct(
         query="halls cough drops",
         label="Halls menthol cough drops",
+        expected_category=ProductCategory.LOZENGE,
+        expected_dosage_keywords=("LOZENGE",),
+        expected_fields={
+            "flash_point_c": "None, No Flash Point",
+            "transport_regulated": "No, not regulated",
+        },
+    ),
+    GoldenProduct(
+        query="Ricola",
+        label="Ricola throat lozenge (menthol PubChem disagree case)",
+        # Regression: menthol's PubChem flash (~91C) is just below the
+        # 93C threshold for 'None, No Flash Point' agreement. PubChem
+        # disagreement must be informational, not authoritative, for
+        # solid lozenge formulations.
         expected_category=ProductCategory.LOZENGE,
         expected_dosage_keywords=("LOZENGE",),
         expected_fields={

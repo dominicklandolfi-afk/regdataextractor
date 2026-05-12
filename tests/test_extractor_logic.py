@@ -680,6 +680,121 @@ class TestApplyInertFormDefaults:
         assert "derived" not in sources["flash_point_c"]
 
 
+class TestSafetyAsymmetricGuard:
+    """When Perplexity returned a flammable or regulated value but the
+    category default says non-flammable / non-regulated, preserve
+    Perplexity's value. Catches the Bengay case: 30% isopropyl alcohol
+    is an INACTIVE ingredient that DailyMed doesn't expose, so the
+    classifier says TOPICAL_NONFLAM, but the SDS correctly says <23C.
+    """
+
+    @staticmethod
+    def _sds_with_perplexity_flammable() -> SDSExtraction:
+        """Mirrors what Perplexity returns when it reads an SDS for a
+        topical product with a flammable inactive ingredient."""
+        return SDSExtraction(
+            product_type=ExtractedField(value="Prescription Pharmaceutical (Liquid)", confidence=80),
+            secondary_physical_state=ExtractedField(value="Gel", confidence=80),
+            ph_mixture_extreme=ExtractedField(value="No", confidence=80),
+            ph_value=ExtractedField(value="4 - 6.9", confidence=70),
+            water_solubility=ExtractedField(value="Miscible in water", confidence=70),
+            boiling_point_c=ExtractedField(value=">37.7C (99.9F)", confidence=70),
+            flash_point_c=ExtractedField(value="<23C", confidence=75),
+            flash_point_method=ExtractedField(value="Closed cup method", confidence=70),
+            storage_temp_range=ExtractedField(value="Controlled room temperature of 20C to 25C", confidence=80),
+            transport_regulated=ExtractedField(value="Yes, Agree", confidence=75),
+            un_number=ExtractedField(value="UN1219", confidence=70),
+            proper_shipping_name=ExtractedField(value="Isopropanol", confidence=70),
+            hazard_class=ExtractedField(value="3", confidence=75),
+            packing_group=ExtractedField(value="II", confidence=70),
+            rcra_classification=ExtractedField(value="D001 Hazardous Waste under RCRA", confidence=70),
+        )
+
+    def test_bengay_with_inactive_alcohol_preserves_flammable_flash(self) -> None:
+        # DailyMed: dosage_form=GEL, generic=MENTHOL, no alcohol in actives.
+        # Classifier: TOPICAL_NONFLAM (wrong because of hidden inactive)
+        # SDS-driven Perplexity: flash <23C (correct for 30% IPA gel)
+        # Expected: preserve Perplexity's <23C, do NOT stamp 'None'
+        sds = self._sds_with_perplexity_flammable()
+        dm = DailyMedData(
+            product_name="BENGAY VANISHING SCENT",
+            generic_name="MENTHOL",
+            dosage_form="GEL",
+        )
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+        _apply_inert_form_defaults(sds, dm, ["menthol"], sources)
+
+        assert sds.flash_point_c.value == "<23C"
+        assert "safety guard" in sources["flash_point_c"]
+        assert "derived" not in sources["flash_point_c"]
+
+    def test_safety_guard_does_not_apply_to_transport_regulated(self) -> None:
+        # transport_regulated is downstream of flash_point - if we trust
+        # the flash point, transport classification follows. The guard
+        # is intentionally narrow to flash_point_c to avoid false
+        # positives like Flonase getting 'Yes, Agree' from a Perplexity
+        # mis-read of the SDS.
+        sds = self._sds_with_perplexity_flammable()
+        # Drop Perplexity's transport confidence so the category default
+        # fires (override_below=70). At conf 75 in the fixture, the
+        # category would have left it alone for a different reason.
+        sds.transport_regulated.confidence = 50
+        dm = DailyMedData(dosage_form="GEL", generic_name="MENTHOL")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+        _apply_inert_form_defaults(sds, dm, ["menthol"], sources)
+
+        # flash_point preserved (the guard's actual scope)
+        assert sds.flash_point_c.value == "<23C"
+        # transport flows through category default normally now that
+        # Perplexity's transport_regulated conf is below override_below
+        assert sds.transport_regulated.value == "No, not regulated"
+        assert "safety guard" not in sources["transport_regulated"]
+
+    def test_safety_guard_requires_minimum_confidence(self) -> None:
+        # Perplexity returning flammable at confidence <50 is treated as
+        # a guess and overridden by the category. Above 50 it's trusted.
+        sds = self._sds_with_perplexity_flammable()
+        sds.flash_point_c.confidence = 40  # low-confidence guess
+        dm = DailyMedData(dosage_form="GEL", generic_name="MENTHOL")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+        _apply_inert_form_defaults(sds, dm, ["menthol"], sources)
+
+        # Category default wins because Perplexity wasn't confident
+        assert sds.flash_point_c.value == "None, No Flash Point"
+        assert "derived" in sources["flash_point_c"]
+        assert "safety guard" not in sources["flash_point_c"]
+
+    def test_safety_guard_does_not_block_legitimate_defaults(self) -> None:
+        # When Perplexity returned 'None, No Flash Point' (the same value
+        # the category default would set), the override still fires
+        # normally - safety guard only triggers on asymmetric values.
+        sds = SDSExtraction(
+            product_type=ExtractedField(value="Prescription Pharmaceutical (Solid)", confidence=80),
+            secondary_physical_state=ExtractedField(value="Capsule/Tablet", confidence=80),
+            ph_mixture_extreme=ExtractedField(value="No", confidence=50),
+            ph_value=ExtractedField(value=None, confidence=40),
+            water_solubility=ExtractedField(value=None, confidence=40),
+            boiling_point_c=ExtractedField(value=None, confidence=40),
+            flash_point_c=ExtractedField(value="None, No Flash Point", confidence=50),
+            flash_point_method=ExtractedField(value=None, confidence=40),
+            storage_temp_range=ExtractedField(value="Controlled room temperature of 20C to 25C", confidence=80),
+            transport_regulated=ExtractedField(value="No, not regulated", confidence=50),
+            un_number=ExtractedField(value="", confidence=80),
+            proper_shipping_name=ExtractedField(value="", confidence=80),
+            hazard_class=ExtractedField(value="", confidence=80),
+            packing_group=ExtractedField(value="", confidence=80),
+            rcra_classification=ExtractedField(value="Not classified as D001 or D003 Hazardous Waste under RCRA", confidence=50),
+        )
+        dm = DailyMedData(dosage_form="TABLET")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+        _apply_inert_form_defaults(sds, dm, ["acetaminophen"], sources)
+
+        assert sds.flash_point_c.value == "None, No Flash Point"
+        assert sds.flash_point_c.confidence == 95
+        assert "derived" in sources["flash_point_c"]
+        assert "safety guard" not in sources["flash_point_c"]
+
+
 class TestCriticalFieldsConstant:
     """Make sure CRITICAL_FIELDS only includes the five UL portal-critical
     fields. Adding a new field here changes flagging behavior across the

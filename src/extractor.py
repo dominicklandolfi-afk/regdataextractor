@@ -140,6 +140,7 @@ def _enrich_pubchem(
     pubchem_records: list[pubchem.PubChemData],
     sources: dict[str, list[str]],
     extra_review: list[str],
+    category: Optional[ProductCategory] = None,
 ) -> None:
     """Cross-reference each active ingredient against the SDS values.
 
@@ -147,7 +148,19 @@ def _enrich_pubchem(
     acetaminophen and caffeine do not. When some ingredients have data
     and others don't, the evidence string makes this explicit so the
     reviewer knows we looked them up rather than skipped them.
+
+    When the product's category has a deterministic flash_point_c default
+    (e.g., LOZENGE always 'None, No Flash Point'), a PubChem disagreement
+    on the pure active ingredient is treated as informational, not as a
+    real conflict. Pure-compound flash points (menthol at 91C) don't
+    contradict a formulation-level non-flammable answer because the
+    active is a small fraction of the formulation with no continuous
+    flammable phase.
     """
+    category_has_flash_default = (
+        category is not None
+        and "flash_point_c" in CATEGORY_PROFILES[category].defaults
+    )
     queried = [r for r in pubchem_records if r.cid is not None]
     informative = [r for r in pubchem_records if r.has_any()]
     if not queried:
@@ -190,15 +203,22 @@ def _enrich_pubchem(
 
     if flash_evidence:
         joined = "; ".join(flash_evidence)
-        category_derived = "derived" in sources.get("flash_point_c", [])
+        # PubChem flash is informational (not authoritative) whenever the
+        # field's category has a deterministic answer - the formulation-
+        # level answer is more reliable than the pure-compound flash for
+        # solid, topical, ophthalmic, and patch dose forms. Also treat
+        # as informational if the value was already stamped by the
+        # category override (sources contains 'derived') or by the
+        # safety-asymmetric guard (sources contains 'safety guard').
+        flash_sources = sources.get("flash_point_c", [])
+        treat_as_informational = (
+            category_has_flash_default
+            or "derived" in flash_sources
+            or "safety guard" in flash_sources
+        )
         if any(d is False for d in flash_decisions):
             sources["flash_point_c"].append("pubchem (disagrees)")
-            # When the field was set by a category default (Halls Lozenge:
-            # menthol PubChem flash ~93C disagrees with category answer
-            # 'None, No Flash Point'), the PubChem datum is for the pure
-            # active ingredient not the formulation. Treat as informational
-            # rather than authoritative - the category answer wins.
-            if category_derived:
+            if treat_as_informational:
                 sds.flash_point_c.evidence_quote = _append_evidence(
                     sds.flash_point_c.evidence_quote,
                     f"PubChem ({coverage_note}): {joined}. "
@@ -340,6 +360,58 @@ def _is_inert_dose_form(
     }
 
 
+# Flash point classes that indicate the formulation is flammable.
+# When Perplexity returned any of these for flash_point_c, DO NOT
+# override with 'None, No Flash Point' regardless of category. The
+# SDS knows about inactive flammable solvents (e.g., Bengay's 30%
+# isopropyl alcohol) that DailyMed's active-ingredients list doesn't
+# surface.
+_FLAMMABLE_FLASH_RANGES: frozenset[str] = frozenset({
+    "<23C",
+    ">=23C and <38C",
+    ">=38C and <=60C",
+    ">60C and <93C",
+})
+
+
+# Minimum Perplexity confidence to trust its 'more dangerous' answer
+# over the category default. Below this, Perplexity is essentially
+# guessing and the category default is more reliable. The original
+# Perplexity prompt grades 40-69 as 'inferred from similar products
+# or partial data'; we want at least mid-range inference, not a pure
+# guess.
+_SAFETY_GUARD_MIN_CONF = 50
+
+
+def _safety_asymmetric_skip(
+    fname: str, current_value: str, current_conf: int, default_value: str,
+) -> bool:
+    """Return True when we must preserve Perplexity's value over the
+    category default because Perplexity reported a flammable answer
+    that the category would soften to non-flammable.
+
+    Limited to flash_point_c because flash point is THE safety indicator
+    for combustibility - transport classification, hazard class, and
+    RCRA flow from flash point and concentration thresholds, so trusting
+    the flash point automatically protects the downstream fields. The
+    same guard on transport_regulated would create false positives
+    (Perplexity calling pump nasal sprays 'Yes, Agree') without adding
+    safety value.
+
+    Requires Perplexity confidence >= _SAFETY_GUARD_MIN_CONF so that
+    a low-confidence guess doesn't override a category that the
+    classifier is sure about.
+    """
+    if fname != "flash_point_c":
+        return False
+    if not current_value or current_conf < _SAFETY_GUARD_MIN_CONF:
+        return False
+    return (
+        current_value in _FLAMMABLE_FLASH_RANGES
+        and default_value == "None, No Flash Point"
+    )
+
+
 def _apply_category_defaults(
     sds: SDSExtraction,
     dm: Optional[DailyMedData],
@@ -353,13 +425,14 @@ def _apply_category_defaults(
     defaults plus an override_below threshold. A default fires only when
     Perplexity returned the field with confidence strictly below the
     threshold - so a confident SDS quote (>=70 typically) is preserved.
-    Categories with no deterministic answers (UNKNOWN, ORAL_LIQUID_ALCOHOL,
-    AEROSOL_PROPELLED for some fields) leave Perplexity in charge.
 
-    Replaces _apply_inert_form_defaults - the old function only handled
-    the non-hazmat case; this one drives every category, including the
-    positive-flammable case (hand sanitizer should be flash <23C, not
-    'None, No Flash Point')."""
+    The safety-asymmetric guard preserves Perplexity's value when it
+    reported a flammable or transport-regulated answer that the category
+    default would soften to non-flammable / non-regulated. Bengay
+    contains 30% isopropyl alcohol as an inactive ingredient that
+    DailyMed does not expose, so the category classifier says
+    TOPICAL_NONFLAM but the SDS correctly says <23C. Believe the SDS.
+    """
     category = classify_product(dm, active_ingredients)
     profile = CATEGORY_PROFILES[category]
     dosage = dm.dosage_form if dm and dm.dosage_form else ""
@@ -367,6 +440,18 @@ def _apply_category_defaults(
         field = getattr(sds, fname)
         current_value = (field.value or "").strip()
         current_conf = field.confidence or 0
+        if _safety_asymmetric_skip(fname, current_value, current_conf, default.value):
+            field.evidence_quote = _append_evidence(
+                field.evidence_quote,
+                f"Category {category.value} suggested '{default.value}' but "
+                f"preserved Perplexity's more conservative value "
+                f"'{current_value}' - SDS likely indicates a flammable "
+                f"inactive ingredient the classifier could not see.",
+            )
+            sources[fname] = list(dict.fromkeys(
+                sources.get(fname, []) + ["safety guard"]
+            ))
+            continue
         if current_value and current_conf >= default.override_below:
             continue  # Trust Perplexity's confident SDS quote
         field.value = default.value
@@ -617,7 +702,7 @@ def _enrich(
     # the confidence we just set.
     category = _apply_category_defaults(sds, dm, active_ingredients or [], sources)
 
-    _enrich_pubchem(sds, pubchem_records, sources, extra_review)
+    _enrich_pubchem(sds, pubchem_records, sources, extra_review, category)
 
     if dot_entry is not None:
         _enrich_dot(sds, dot_entry, sources, extra_review)
