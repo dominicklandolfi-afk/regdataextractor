@@ -227,3 +227,9 @@ class ProductRecord(BaseModel):
                     "of sources that contributed (e.g., ['perplexity', 'dot']). "
                     "Populated by the orchestrator after cross-source enrichment.",
     )
+    category: Optional[str] = Field(
+        default=None,
+        description="Regulatory product category assigned by the classifier "
+                    "(ORAL_SOLID, TOPICAL_ALCOHOL, AEROSOL_PROPELLED, etc.). "
+                    "Drives the deterministic-default profile for the row.",
+    )
