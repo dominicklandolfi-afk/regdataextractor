@@ -288,6 +288,116 @@ _AEROSOL_DOSAGE_HINTS: tuple[str, ...] = (
     "INHALER", "PROPELLANT",
 )
 
+# Dosage forms whose regulatory profile is deterministic regardless of SDS
+# coverage: non-flammable, non-transport-regulated, non-RCRA. An oral tablet
+# has no flash point, no boiling point measurement, no UN number, no RCRA
+# class - those answers are knowable from the dosage form alone.
+_INERT_DOSAGE_KEYWORDS: tuple[str, ...] = (
+    "TABLET", "CAPSULE", "CAPLET", "SOFTGEL", "GELCAP",
+    "POWDER", "GRANULES", "PELLET", "LOZENGE", "TROCHE",
+    "CREAM", "LOTION", "OINTMENT", "PASTE", "GEL", "FOAM",
+    "SOLUTION", "SUSPENSION", "SYRUP", "LIQUID", "ELIXIR", "DROPS",
+    "PATCH", "DENTIFRICE",
+)
+
+# Active ingredients that imply enough flammable solvent to lower the flash
+# point below 93C. If any active matches, skip the inert-form defaults so
+# the SDS-driven values from Perplexity stand.
+_FLAMMABLE_ACTIVE_HINTS: tuple[str, ...] = (
+    "ethanol", "ethyl alcohol", "isopropanol", "isopropyl alcohol",
+    "acetone", "methanol",
+)
+
+
+def _has_flammable_active(active_ingredients: list[str]) -> bool:
+    """True when any active ingredient is a flammable solvent (alcohol-based
+    mouthwash, hand sanitizer, etc.). Blocks the inert-form defaults so the
+    SDS-driven flash point stands."""
+    blob = " ".join(active_ingredients).lower()
+    return any(token in blob for token in _FLAMMABLE_ACTIVE_HINTS)
+
+
+def _is_inert_dose_form(
+    dm: Optional[DailyMedData],
+    active_ingredients: list[str],
+) -> bool:
+    """True when the dosage form puts the product in the always-non-hazmat
+    bucket (oral solids, non-alcohol oral liquids, topicals) AND no active
+    ingredient is a flammable solvent. Aerosols, inhalers, and sprays are
+    excluded because their regulatory profile depends on the propellant."""
+    if dm is None or not dm.dosage_form:
+        return False
+    dosage = dm.dosage_form.upper()
+    if any(hint in dosage for hint in _AEROSOL_DOSAGE_HINTS):
+        return False
+    if not any(k in dosage for k in _INERT_DOSAGE_KEYWORDS):
+        return False
+    return not _has_flammable_active(active_ingredients)
+
+
+# Threshold: if Perplexity returned confidence at or above this, trust its
+# SDS quote and leave the field alone. Below this, treat as "defaulted" and
+# replace with the deterministic answer.
+_INERT_OVERRIDE_BELOW = 70
+
+# Deterministic answers for inert dose forms. Each entry is the target value
+# and the confidence to assign. These values are correct for any oral tablet,
+# capsule, non-alcohol liquid, or topical regardless of what the SDS says
+# (or doesn't say).
+_INERT_FORM_DEFAULTS: tuple[tuple[str, str, int], ...] = (
+    ("flash_point_c", "None, No Flash Point", 95),
+    ("flash_point_method", "Not applicable/available", 95),
+    ("boiling_point_c", "Not tested/Unknown", 90),
+    ("ph_value", "Not tested/Unknown", 85),
+    ("ph_mixture_extreme", "No", 90),
+    ("water_solubility", "No data available", 70),
+    ("transport_regulated", "No, not regulated", 95),
+    (
+        "rcra_classification",
+        "Not classified as D001 or D003 Hazardous Waste under RCRA",
+        95,
+    ),
+)
+
+
+def _apply_inert_form_defaults(
+    sds: SDSExtraction,
+    dm: Optional[DailyMedData],
+    active_ingredients: list[str],
+    sources: dict[str, list[str]],
+) -> None:
+    """Fill the eight SDS Section 9 / transport / RCRA fields with their
+    deterministic answers when the dosage form is inherently non-hazmat.
+    Skipped per-field when Perplexity already returned a confident value
+    (>=70) - that quote stands. Skipped entirely when the dosage form is
+    aerosol/inhaler/spray, or when an active ingredient is a flammable
+    solvent (mouthwash with ethanol, hand sanitizer, etc.).
+
+    This is the fix for the false-flag problem on oral OTCs: Tylenol,
+    Advil, Ibuprofen tablets have no Section 9 data on their SDS because
+    tablets don't have a flash point, boiling point, or pH. Perplexity
+    correctly says "not stated" and assigns ~50 confidence, which trips
+    the review threshold. The dosage form alone tells us the right answer.
+    """
+    if not _is_inert_dose_form(dm, active_ingredients):
+        return
+    dosage = dm.dosage_form if dm else ""
+    for fname, target_value, target_conf in _INERT_FORM_DEFAULTS:
+        field = getattr(sds, fname)
+        current_value = (field.value or "").strip()
+        current_conf = field.confidence or 0
+        if current_value and current_conf >= _INERT_OVERRIDE_BELOW:
+            continue  # Trust Perplexity's confident SDS quote
+        field.value = target_value
+        field.confidence = target_conf
+        field.evidence_quote = _append_evidence(
+            field.evidence_quote,
+            f"Derived from DailyMed dosage form '{dosage}': non-flammable, "
+            f"non-aerosol dose forms have a deterministic answer for this "
+            f"field regardless of SDS coverage.",
+        )
+        sources[fname] = list(dict.fromkeys(sources.get(fname, []) + ["derived"]))
+
 # Maps DailyMed dosage form keywords to the secondary_physical_state enum
 # values that are reasonable matches. Used as a sanity check on Perplexity's
 # choice. Each tuple is (keyword in dosage form, allowed enum values).
@@ -436,12 +546,19 @@ def _enrich(
     pubchem_records: list[pubchem.PubChemData],
     dot_entry: Optional[dot_hazmat.DOTEntry],
     dm: Optional[DailyMedData] = None,
+    active_ingredients: Optional[list[str]] = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Mutate sds with cross-source enrichment. Return (sources_map, extra_review)."""
     sources: dict[str, list[str]] = {
         fname: ["perplexity"] for fname in SDSExtraction.model_fields.keys()
     }
     extra_review: list[str] = []
+
+    # Apply inert-form defaults BEFORE PubChem so the cross-check has a real
+    # baseline to compare against. PubChem can still flag a conflict (e.g.,
+    # if an active ingredient unexpectedly flashes low) and demote the
+    # confidence we just set.
+    _apply_inert_form_defaults(sds, dm, active_ingredients or [], sources)
 
     _enrich_pubchem(sds, pubchem_records, sources, extra_review)
 
@@ -501,7 +618,9 @@ def extract_product(query: str) -> ProductRecord:
         hazard_class_hint=hazard_hint or None,
     )
 
-    sources_map, extra_review = _enrich(sds, pubchem_records, dot_entry, dm)
+    sources_map, extra_review = _enrich(
+        sds, pubchem_records, dot_entry, dm, active_ingredients
+    )
 
     needs_review, reasons = _evaluate_review(sds)
     if extra_review:

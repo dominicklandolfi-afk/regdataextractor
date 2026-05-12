@@ -16,8 +16,11 @@ from src.extractor import (
     CRITICAL_FIELDS,
     TRANSPORT_DETAIL_FIELDS,
     TRANSPORT_NOT_REGULATED,
+    _apply_inert_form_defaults,
     _check_dosage_form_consistency,
     _enrich_pubchem,
+    _has_flammable_active,
+    _is_inert_dose_form,
     _looks_regulated,
     _normalize_non_hazmat,
     _physical_state_matches_dosage,
@@ -312,6 +315,217 @@ class TestEnrichPubchem:
         assert "acetaminophen" in evidence
         assert "caffeine" in evidence
         assert "no flash point data for" in evidence
+
+
+class TestInertDoseFormDetection:
+    """The gate that controls whether the deterministic non-hazmat defaults
+    fire. Should match common solid/liquid/topical dose forms and skip
+    aerosols + alcohol-bearing products."""
+
+    @pytest.mark.parametrize("dosage_form,expected", [
+        ("TABLET, FILM COATED", True),
+        ("CAPSULE", True),
+        ("CAPLET", True),
+        ("SOFTGEL", True),
+        ("POWDER, FOR ORAL SUSPENSION", True),
+        ("GRANULES", True),
+        ("CREAM", True),
+        ("OINTMENT", True),
+        ("LOTION", True),
+        ("GEL", True),
+        ("PASTE, DENTIFRICE", True),
+        ("SOLUTION", True),
+        ("SUSPENSION", True),
+        ("SYRUP", True),
+        ("PATCH", True),
+        ("LOZENGE", True),
+        ("AEROSOL, METERED", False),
+        ("INHALER", False),
+        ("INHALANT", False),
+        ("SPRAY", False),
+        ("METERED-DOSE INHALER", False),
+        ("", False),
+    ])
+    def test_dosage_form_matrix(self, dosage_form, expected) -> None:
+        dm = DailyMedData(dosage_form=dosage_form) if dosage_form else DailyMedData()
+        assert _is_inert_dose_form(dm, []) is expected
+
+    def test_none_dailymed_returns_false(self) -> None:
+        assert _is_inert_dose_form(None, []) is False
+
+    def test_mouthwash_with_alcohol_active_is_blocked(self) -> None:
+        dm = DailyMedData(dosage_form="MOUTHWASH")  # not in inert keyword list
+        assert _is_inert_dose_form(dm, ["ethanol"]) is False
+
+    def test_oral_liquid_with_alcohol_active_is_blocked(self) -> None:
+        # Hand sanitizer is a "LIQUID" but contains ethanol/isopropanol
+        dm = DailyMedData(dosage_form="LIQUID")
+        assert _is_inert_dose_form(dm, ["isopropyl alcohol"]) is False
+        assert _is_inert_dose_form(dm, ["ETHANOL"]) is False
+
+    def test_oral_liquid_without_alcohol_is_inert(self) -> None:
+        dm = DailyMedData(dosage_form="SOLUTION")
+        assert _is_inert_dose_form(dm, ["acetaminophen"]) is True
+
+
+class TestFlammableActiveDetection:
+    """Checks the alcohol/solvent guard that protects mouthwash, hand
+    sanitizer, and oral liquids with ethanol from getting wrong defaults."""
+
+    @pytest.mark.parametrize("ingredients,expected", [
+        (["ethanol"], True),
+        (["ETHANOL"], True),
+        (["ethyl alcohol"], True),
+        (["isopropanol"], True),
+        (["isopropyl alcohol"], True),
+        (["Acetone"], True),
+        (["acetaminophen", "ethanol"], True),
+        (["acetaminophen"], False),
+        (["ibuprofen"], False),
+        (["aspirin", "caffeine", "acetaminophen"], False),
+        ([], False),
+    ])
+    def test_flammable_active_detection(self, ingredients, expected) -> None:
+        assert _has_flammable_active(ingredients) is expected
+
+
+class TestApplyInertFormDefaults:
+    """The fix for the false-flag problem: tablets/capsules/non-alcohol
+    liquids/topicals should get deterministic high-confidence answers on
+    the eight SDS Section 9 / transport / RCRA fields, regardless of how
+    sparse the SDS is."""
+
+    @staticmethod
+    def _low_conf_sds() -> SDSExtraction:
+        """Simulates what Perplexity returns when no SDS data is found:
+        defaulted values at confidence 50, below the review threshold."""
+        return SDSExtraction(
+            product_type=ExtractedField(value="Prescription Pharmaceutical (Solid)", confidence=80),
+            secondary_physical_state=ExtractedField(value="Capsule/Tablet", confidence=80),
+            ph_mixture_extreme=ExtractedField(value="No", confidence=50),
+            ph_value=ExtractedField(value=None, confidence=40),
+            water_solubility=ExtractedField(value=None, confidence=40),
+            boiling_point_c=ExtractedField(value=None, confidence=40),
+            flash_point_c=ExtractedField(value="None, No Flash Point", confidence=50),
+            flash_point_method=ExtractedField(value=None, confidence=40),
+            storage_temp_range=ExtractedField(value="Controlled room temperature of 20C to 25C", confidence=80),
+            transport_regulated=ExtractedField(value="No, not regulated", confidence=50),
+            un_number=ExtractedField(value="", confidence=80),
+            proper_shipping_name=ExtractedField(value="", confidence=80),
+            hazard_class=ExtractedField(value="", confidence=80),
+            packing_group=ExtractedField(value="", confidence=80),
+            rcra_classification=ExtractedField(
+                value="Not classified as D001 or D003 Hazardous Waste under RCRA",
+                confidence=50,
+            ),
+        )
+
+    def test_tylenol_tablet_gets_high_confidence_defaults(self) -> None:
+        sds = self._low_conf_sds()
+        dm = DailyMedData(dosage_form="TABLET, FILM COATED")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["acetaminophen"], sources)
+
+        # All eight fields now meet or exceed the review threshold of 60
+        assert sds.flash_point_c.value == "None, No Flash Point"
+        assert sds.flash_point_c.confidence == 95
+        assert sds.flash_point_method.value == "Not applicable/available"
+        assert sds.flash_point_method.confidence == 95
+        assert sds.boiling_point_c.value == "Not tested/Unknown"
+        assert sds.boiling_point_c.confidence == 90
+        assert sds.ph_value.value == "Not tested/Unknown"
+        assert sds.ph_value.confidence == 85
+        assert sds.ph_mixture_extreme.value == "No"
+        assert sds.ph_mixture_extreme.confidence == 90
+        assert sds.water_solubility.value == "No data available"
+        assert sds.water_solubility.confidence == 70
+        assert sds.transport_regulated.value == "No, not regulated"
+        assert sds.transport_regulated.confidence == 95
+        assert sds.rcra_classification.confidence == 95
+        # Each overridden field is marked as derived in the source map
+        for fname in (
+            "flash_point_c", "flash_point_method", "boiling_point_c",
+            "ph_value", "ph_mixture_extreme", "water_solubility",
+            "transport_regulated", "rcra_classification",
+        ):
+            assert "derived" in sources[fname], f"{fname} missing derived source"
+
+    def test_ibuprofen_tablet_gets_defaults(self) -> None:
+        sds = self._low_conf_sds()
+        dm = DailyMedData(dosage_form="TABLET, COATED")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["ibuprofen"], sources)
+
+        assert sds.flash_point_c.confidence == 95
+        assert sds.transport_regulated.confidence == 95
+
+    def test_advil_capsule_gets_defaults(self) -> None:
+        sds = self._low_conf_sds()
+        dm = DailyMedData(dosage_form="CAPSULE, LIQUID FILLED")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["ibuprofen"], sources)
+
+        assert sds.flash_point_c.confidence == 95
+        assert sds.rcra_classification.confidence == 95
+
+    def test_high_confidence_perplexity_value_is_preserved(self) -> None:
+        # Hypothetical: Perplexity found a real SDS for a tablet and quoted
+        # a non-default flash point at confidence 90. The override must NOT
+        # clobber that real datum.
+        sds = self._low_conf_sds()
+        sds.flash_point_c = ExtractedField(
+            value=">=93C and <=815C", confidence=92,
+            evidence_quote="SDS Section 9: Flash point 200°C",
+        )
+        dm = DailyMedData(dosage_form="TABLET")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["acetaminophen"], sources)
+
+        assert sds.flash_point_c.value == ">=93C and <=815C"
+        assert sds.flash_point_c.confidence == 92
+        assert "derived" not in sources["flash_point_c"]
+        # Other low-conf fields still get defaulted
+        assert sds.transport_regulated.confidence == 95
+
+    def test_aerosol_inhaler_skips_defaults(self) -> None:
+        # Albuterol HFA is regulated for transport (UN1950) and we must
+        # not stamp it as "not regulated".
+        sds = self._low_conf_sds()
+        dm = DailyMedData(dosage_form="AEROSOL, METERED")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["albuterol"], sources)
+
+        # Confidence stays at the original 50; no derived sources added
+        assert sds.transport_regulated.confidence == 50
+        assert "derived" not in sources["transport_regulated"]
+        assert sds.flash_point_c.confidence == 50
+
+    def test_alcohol_mouthwash_skips_defaults(self) -> None:
+        # Listerine-style mouthwash with ethanol must keep SDS-driven
+        # answers so the actual flash point is preserved.
+        sds = self._low_conf_sds()
+        dm = DailyMedData(dosage_form="LIQUID")
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, dm, ["eucalyptol", "ethanol"], sources)
+
+        assert sds.flash_point_c.confidence == 50
+        assert "derived" not in sources["flash_point_c"]
+
+    def test_no_dailymed_skips_defaults(self) -> None:
+        sds = self._low_conf_sds()
+        sources = {f: ["perplexity"] for f in SDSExtraction.model_fields.keys()}
+
+        _apply_inert_form_defaults(sds, None, [], sources)
+        _apply_inert_form_defaults(sds, DailyMedData(), [], sources)
+
+        assert sds.flash_point_c.confidence == 50
+        assert "derived" not in sources["flash_point_c"]
 
 
 class TestCriticalFieldsConstant:
