@@ -300,21 +300,57 @@ _INERT_DOSAGE_KEYWORDS: tuple[str, ...] = (
     "PATCH", "DENTIFRICE",
 )
 
-# Active ingredients that imply enough flammable solvent to lower the flash
-# point below 93C. If any active matches, skip the inert-form defaults so
-# the SDS-driven values from Perplexity stand.
+# Substrings that strongly imply a flammable solvent in the formulation.
+# Checked against active_ingredients + generic_name + product_name because
+# DailyMed sometimes encodes the solvent only in generic_name (Purell's
+# DailyMed entry has active_ingredients=[] and generic_name='ALCOHOL').
 _FLAMMABLE_ACTIVE_HINTS: tuple[str, ...] = (
     "ethanol", "ethyl alcohol", "isopropanol", "isopropyl alcohol",
-    "acetone", "methanol",
+    "acetone", "methanol", "denatured alcohol", "sd alcohol",
+    "grain alcohol", "hand sanitizer", "sanitizing",
+)
+
+# 'alcohol' alone is ambiguous: it matches DailyMed's 'ALCOHOL' generic
+# name for hand sanitizer (flammable) but also cetyl/stearyl/benzyl/
+# polyvinyl alcohol (waxes and polymers, not flammable). Treat standalone
+# 'alcohol' as flammable UNLESS it appears with one of these prefixes.
+_NONFLAMMABLE_ALCOHOL_PREFIXES: tuple[str, ...] = (
+    "cetyl alcohol", "stearyl alcohol", "cetostearyl alcohol",
+    "cetearyl alcohol", "benzyl alcohol", "polyvinyl alcohol",
+    "lanolin alcohol", "wool alcohol", "lauryl alcohol",
+    "myristyl alcohol", "behenyl alcohol", "oleyl alcohol",
 )
 
 
-def _has_flammable_active(active_ingredients: list[str]) -> bool:
-    """True when any active ingredient is a flammable solvent (alcohol-based
-    mouthwash, hand sanitizer, etc.). Blocks the inert-form defaults so the
-    SDS-driven flash point stands."""
-    blob = " ".join(active_ingredients).lower()
-    return any(token in blob for token in _FLAMMABLE_ACTIVE_HINTS)
+def _has_flammable_active(strings: list[str]) -> bool:
+    """True when any input string is a flammable solvent marker. Used by
+    the inert-form guard to skip alcohol-bearing products (hand sanitizer,
+    mouthwash, some oral liquids). Handles the bare word 'alcohol' as
+    flammable except when it appears as a fatty/wax alcohol (cetyl,
+    stearyl, benzyl, polyvinyl, etc.)."""
+    blob = " ".join(s for s in strings if s).lower()
+    if any(token in blob for token in _FLAMMABLE_ACTIVE_HINTS):
+        return True
+    if "alcohol" in blob:
+        return not any(prefix in blob for prefix in _NONFLAMMABLE_ALCOHOL_PREFIXES)
+    return False
+
+
+def _flammability_strings(
+    dm: Optional[DailyMedData],
+    active_ingredients: list[str],
+) -> list[str]:
+    """Collect every DailyMed string that might indicate a flammable
+    solvent: active ingredients (when populated), generic_name, and
+    product_name. Active-ingredients-only was too narrow because DailyMed
+    sometimes leaves the list empty and stores the solvent in generic_name."""
+    bits: list[str] = list(active_ingredients)
+    if dm is not None:
+        if dm.generic_name:
+            bits.append(dm.generic_name)
+        if dm.product_name:
+            bits.append(dm.product_name)
+    return bits
 
 
 def _is_inert_dose_form(
@@ -324,7 +360,11 @@ def _is_inert_dose_form(
     """True when the dosage form puts the product in the always-non-hazmat
     bucket (oral solids, non-alcohol oral liquids, topicals) AND no active
     ingredient is a flammable solvent. Aerosols, inhalers, and sprays are
-    excluded because their regulatory profile depends on the propellant."""
+    excluded because their regulatory profile depends on the propellant.
+
+    The flammable check looks at active_ingredients, generic_name, and
+    product_name together so 'PURELL HAND SANITIZER' with generic 'ALCOHOL'
+    is correctly excluded even when active_ingredients is empty."""
     if dm is None or not dm.dosage_form:
         return False
     dosage = dm.dosage_form.upper()
@@ -332,7 +372,7 @@ def _is_inert_dose_form(
         return False
     if not any(k in dosage for k in _INERT_DOSAGE_KEYWORDS):
         return False
-    return not _has_flammable_active(active_ingredients)
+    return not _has_flammable_active(_flammability_strings(dm, active_ingredients))
 
 
 # Threshold: if Perplexity returned confidence at or above this, trust its
@@ -451,6 +491,58 @@ def _physical_state_matches_dosage(dosage_form: str, picked_state: str) -> Optio
     return None
 
 
+# Canonical secondary_physical_state for each dosage form keyword. Used to
+# auto-correct Perplexity when it picks a value that's clearly wrong for
+# the form (e.g., 'Capsule/Tablet' on a PATCH). First match wins; order
+# the same as _DOSAGE_PHYSICAL_STATE_MAP so the more-specific keywords
+# (PATCH, SOFTGEL) hit before the generic ones (TABLET, LIQUID).
+# Order matters: more-specific keywords MUST come before substrings of
+# themselves. 'SOFTGEL' before 'GEL' so a softgel capsule doesn't pick
+# 'Gel'. 'INHALANT'/'INHALER' before 'INHALATION' for the same reason.
+_DOSAGE_CANONICAL_STATE: tuple[tuple[str, str], ...] = (
+    ("SOFTGEL", "Capsule/Tablet"),
+    ("GELCAP", "Capsule/Tablet"),
+    ("CREAM", "Cream/Lotion"),
+    ("LOTION", "Cream/Lotion"),
+    ("OINTMENT", "Ointment"),
+    ("PASTE", "Paste"),
+    ("FOAM", "Foam"),
+    ("AEROSOL", "Aerosol"),
+    ("INHALANT", "Inhaler"),
+    ("INHALER", "Inhaler"),
+    ("INHALATION", "Aerosol"),
+    ("SPRAY", "Liquid spray"),
+    ("POWDER", "Powder(s)"),
+    ("GRANULES", "Granular"),
+    ("TABLET", "Capsule/Tablet"),
+    ("CAPSULE", "Capsule/Tablet"),
+    ("CAPLET", "Capsule/Tablet"),
+    ("PATCH", "Solid"),
+    ("LOZENGE", "Solid"),
+    ("TROCHE", "Solid"),
+    ("SUSPENSION", "Suspension"),
+    ("SYRUP", "Liquid"),
+    ("ELIXIR", "Liquid"),
+    ("DROPS", "Liquid"),
+    ("SOLUTION", "Liquid"),
+    ("GEL", "Gel"),
+    ("LIQUID", "Liquid"),
+)
+
+
+def _canonical_physical_state(dosage_form: str) -> Optional[str]:
+    """Return the canonical secondary_physical_state enum value for this
+    dosage form, or None when no canonical is known. Used to auto-correct
+    Perplexity when it picks a value that's clearly wrong for the form."""
+    if not dosage_form:
+        return None
+    dosage_upper = dosage_form.upper()
+    for keyword, canonical in _DOSAGE_CANONICAL_STATE:
+        if keyword in dosage_upper:
+            return canonical
+    return None
+
+
 def _looks_regulated(sds: SDSExtraction, dm: Optional[DailyMedData]) -> bool:
     """Defensive: detect contradictions between transport_regulated and
     other signals so we don't normalize an aerosol to 'Not Applicable'.
@@ -519,26 +611,45 @@ def _check_dosage_form_consistency(
     sds: SDSExtraction,
     dm: Optional[DailyMedData],
 ) -> list[str]:
-    """If DailyMed says the product is a CREAM/OINTMENT/etc. but Perplexity
-    picked a tablet-style secondary_physical_state, surface that as a
-    review reason. Catches the failure mode where the model defaulted to
-    'Capsule/Tablet' for a topical."""
+    """When DailyMed's dosage form contradicts Perplexity's pick for
+    secondary_physical_state, auto-correct to the canonical enum value
+    when one is known (PATCH -> 'Solid', OINTMENT -> 'Ointment', etc.)
+    and bump confidence to 90 so the row doesn't flag for a problem we
+    just solved. When no canonical is defined, demote to 50 and return
+    a review reason so the human resolves it.
+
+    Auto-corrections do not return a review reason because the field is
+    now at conf 90 - flagging it as a 'concern' would force needs_review
+    even though the correct answer is already in the cell. The evidence
+    quote records what happened for audit."""
     if not dm or not dm.dosage_form:
         return []
     picked = (sds.secondary_physical_state.value or "").strip()
     if not picked:
         return []
     match = _physical_state_matches_dosage(dm.dosage_form, picked)
-    if match is False:
-        # Demote confidence so the review pane picks it up too.
-        sds.secondary_physical_state.confidence = min(
-            sds.secondary_physical_state.confidence, 50
+    if match is not False:
+        return []
+
+    canonical = _canonical_physical_state(dm.dosage_form)
+    if canonical:
+        sds.secondary_physical_state.value = canonical
+        sds.secondary_physical_state.confidence = 90
+        sds.secondary_physical_state.evidence_quote = _append_evidence(
+            sds.secondary_physical_state.evidence_quote,
+            f"Corrected from '{picked}' to '{canonical}' based on DailyMed "
+            f"dosage form '{dm.dosage_form}': the picked value is not in "
+            f"the allowed enum for this form.",
         )
-        return [
-            f"secondary_physical_state '{picked}' does not match DailyMed "
-            f"dosage form '{dm.dosage_form}' - verify the physical state"
-        ]
-    return []
+        return []
+
+    sds.secondary_physical_state.confidence = min(
+        sds.secondary_physical_state.confidence, 50
+    )
+    return [
+        f"secondary_physical_state '{picked}' does not match DailyMed "
+        f"dosage form '{dm.dosage_form}' - verify the physical state"
+    ]
 
 
 def _enrich(

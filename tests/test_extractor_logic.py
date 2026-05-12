@@ -17,6 +17,7 @@ from src.extractor import (
     TRANSPORT_DETAIL_FIELDS,
     TRANSPORT_NOT_REGULATED,
     _apply_inert_form_defaults,
+    _canonical_physical_state,
     _check_dosage_form_consistency,
     _enrich_pubchem,
     _has_flammable_active,
@@ -133,16 +134,22 @@ class TestDosageConsistencyCheck:
     """End-to-end check that mismatches surface as review reasons and
     demote confidence."""
 
-    def test_desitin_ointment_picked_as_tablet_flags_review(self) -> None:
+    def test_desitin_ointment_picked_as_tablet_auto_corrects(self) -> None:
+        # Wrong pick on a known dosage form is now auto-corrected to the
+        # canonical enum value (Ointment) at confidence 90 so the row
+        # doesn't flag for a problem we just solved. Evidence quote
+        # records the correction.
         dm = DailyMedData(dosage_form="OINTMENT")
         sds = _blank_sds(
             secondary_physical_state=ExtractedField(value="Capsule/Tablet", confidence=80)
         )
         reasons = _check_dosage_form_consistency(sds, dm)
-        assert len(reasons) == 1
-        assert "OINTMENT" in reasons[0]
-        assert "Capsule/Tablet" in reasons[0]
-        assert sds.secondary_physical_state.confidence == 50
+        assert reasons == []
+        assert sds.secondary_physical_state.value == "Ointment"
+        assert sds.secondary_physical_state.confidence == 90
+        assert "Corrected" in (sds.secondary_physical_state.evidence_quote or "")
+        assert "Capsule/Tablet" in (sds.secondary_physical_state.evidence_quote or "")
+        assert "OINTMENT" in (sds.secondary_physical_state.evidence_quote or "")
 
     def test_correct_classification_passes_silently(self) -> None:
         dm = DailyMedData(dosage_form="OINTMENT")
@@ -372,21 +379,164 @@ class TestFlammableActiveDetection:
     """Checks the alcohol/solvent guard that protects mouthwash, hand
     sanitizer, and oral liquids with ethanol from getting wrong defaults."""
 
-    @pytest.mark.parametrize("ingredients,expected", [
+    @pytest.mark.parametrize("strings,expected", [
+        # Explicit flammable tokens
         (["ethanol"], True),
         (["ETHANOL"], True),
         (["ethyl alcohol"], True),
         (["isopropanol"], True),
         (["isopropyl alcohol"], True),
         (["Acetone"], True),
+        (["methanol"], True),
+        (["denatured alcohol"], True),
+        (["SD Alcohol 40"], True),
         (["acetaminophen", "ethanol"], True),
+        # Bare 'alcohol' (e.g., DailyMed generic_name for hand sanitizer)
+        (["ALCOHOL"], True),
+        (["alcohol"], True),
+        # Hand sanitizer / sanitizing keyword fires even without an
+        # explicit alcohol token, in case DailyMed encodes the product
+        # only in the product name.
+        (["PURELL HAND SANITIZER"], True),
+        # Fatty alcohols and polymers are NOT flammable
+        (["cetyl alcohol"], False),
+        (["stearyl alcohol"], False),
+        (["cetostearyl alcohol"], False),
+        (["benzyl alcohol"], False),
+        (["polyvinyl alcohol"], False),
+        (["lanolin alcohol"], False),
+        (["cetearyl alcohol", "water"], False),
+        # Real active ingredients with no flammable solvent
         (["acetaminophen"], False),
         (["ibuprofen"], False),
         (["aspirin", "caffeine", "acetaminophen"], False),
+        (["nicotine"], False),
         ([], False),
     ])
-    def test_flammable_active_detection(self, ingredients, expected) -> None:
-        assert _has_flammable_active(ingredients) is expected
+    def test_flammable_active_detection(self, strings, expected) -> None:
+        assert _has_flammable_active(strings) is expected
+
+
+class TestPurellRegression:
+    """Bug 1: hand sanitizer with DailyMed generic_name='ALCOHOL' and
+    empty active_ingredients was incorrectly classified as inert and
+    stamped with 'None, No Flash Point'. The flammable check now reads
+    generic_name + product_name on top of active_ingredients."""
+
+    def test_purell_with_alcohol_generic_name_is_not_inert(self) -> None:
+        # Mirrors the actual DailyMed response for "Purell hand sanitizer"
+        dm = DailyMedData(
+            product_name="PURELL ADVANCED HAND SANITIZER FRAGRANCE FREE",
+            generic_name="ALCOHOL",
+            dosage_form="LIQUID",
+            active_ingredients=[],
+        )
+        assert _is_inert_dose_form(dm, []) is False
+
+    def test_listerine_with_alcohol_in_product_name(self) -> None:
+        # Mouthwash where DailyMed might encode alcohol only in product
+        # name (not always returned as an active)
+        dm = DailyMedData(
+            product_name="LISTERINE COOL MINT ANTISEPTIC MOUTHWASH",
+            generic_name="EUCALYPTOL, MENTHOL, METHYL SALICYLATE, THYMOL",
+            dosage_form="LIQUID",
+            active_ingredients=["eucalyptol", "menthol", "methyl salicylate", "thymol"],
+        )
+        # Without ethanol-in-strings, this would be treated as inert.
+        # In reality DailyMed returns ethanol as an active for Listerine,
+        # so this test documents the "no ethanol surfaced anywhere" path.
+        # An honest gap: if DailyMed truly hides the alcohol, we can't
+        # catch it from name alone. The Purell case is the realistic one.
+        assert _is_inert_dose_form(dm, ["eucalyptol", "menthol"]) is True
+
+    def test_hand_sanitizer_keyword_in_product_name_blocks(self) -> None:
+        # Defense-in-depth: 'hand sanitizer' or 'sanitizing' in the name
+        # blocks the inert defaults even when no active is surfaced.
+        dm = DailyMedData(
+            product_name="GENERIC HAND SANITIZER",
+            generic_name="",
+            dosage_form="LIQUID",
+        )
+        assert _is_inert_dose_form(dm, []) is False
+
+
+class TestCanonicalPhysicalState:
+    """Bug 2 helper: each dosage form keyword maps to exactly one canonical
+    enum value used for auto-correction."""
+
+    @pytest.mark.parametrize("dosage_form,expected", [
+        ("TABLET", "Capsule/Tablet"),
+        ("TABLET, FILM COATED", "Capsule/Tablet"),
+        ("CAPSULE", "Capsule/Tablet"),
+        ("SOFTGEL", "Capsule/Tablet"),
+        ("PATCH, EXTENDED RELEASE", "Solid"),
+        ("PATCH", "Solid"),
+        ("OINTMENT", "Ointment"),
+        ("CREAM", "Cream/Lotion"),
+        ("LOTION", "Cream/Lotion"),
+        ("PASTE, DENTIFRICE", "Paste"),
+        ("GEL, DENTIFRICE", "Gel"),
+        ("FOAM", "Foam"),
+        ("SOLUTION", "Liquid"),
+        ("SUSPENSION", "Suspension"),
+        ("SYRUP", "Liquid"),
+        ("AEROSOL, METERED", "Aerosol"),
+        ("INHALER", "Inhaler"),
+        ("POWDER", "Powder(s)"),
+        ("LOZENGE", "Solid"),
+    ])
+    def test_canonical_lookup(self, dosage_form, expected) -> None:
+        assert _canonical_physical_state(dosage_form) == expected
+
+    def test_unknown_dosage_returns_none(self) -> None:
+        assert _canonical_physical_state("MYSTERY_FORM") is None
+        assert _canonical_physical_state("") is None
+
+
+class TestNicodermRegression:
+    """Bug 2: Perplexity picked 'Capsule/Tablet' for Nicoderm CQ's PATCH
+    dosage form. The consistency check now auto-corrects to 'Solid' at
+    confidence 90 instead of demoting to 50 and flagging."""
+
+    def test_patch_picked_as_tablet_auto_corrects_to_solid(self) -> None:
+        dm = DailyMedData(
+            product_name="NICODERM CQ",
+            generic_name="NICOTINE",
+            dosage_form="PATCH, EXTENDED RELEASE",
+        )
+        sds = _blank_sds(
+            secondary_physical_state=ExtractedField(value="Capsule/Tablet", confidence=50)
+        )
+        reasons = _check_dosage_form_consistency(sds, dm)
+
+        # No review reason because we corrected it
+        assert reasons == []
+        # Value replaced with the canonical for PATCH
+        assert sds.secondary_physical_state.value == "Solid"
+        # Confidence raised above the review threshold
+        assert sds.secondary_physical_state.confidence == 90
+
+    def test_aerosol_picked_as_tablet_auto_corrects_to_aerosol(self) -> None:
+        # Same fix protects albuterol-style mistakes
+        dm = DailyMedData(dosage_form="AEROSOL, METERED")
+        sds = _blank_sds(
+            secondary_physical_state=ExtractedField(value="Capsule/Tablet", confidence=50)
+        )
+        reasons = _check_dosage_form_consistency(sds, dm)
+        assert reasons == []
+        assert sds.secondary_physical_state.value == "Aerosol"
+        assert sds.secondary_physical_state.confidence == 90
+
+    def test_correct_value_passes_through_unchanged(self) -> None:
+        dm = DailyMedData(dosage_form="PATCH, EXTENDED RELEASE")
+        sds = _blank_sds(
+            secondary_physical_state=ExtractedField(value="Solid", confidence=85)
+        )
+        reasons = _check_dosage_form_consistency(sds, dm)
+        assert reasons == []
+        # Untouched
+        assert sds.secondary_physical_state.value == "Solid"
+        assert sds.secondary_physical_state.confidence == 85
 
 
 class TestApplyInertFormDefaults:
